@@ -1,5 +1,5 @@
 diff --git a/libswc/compositor.c b/libswc/compositor.c
-index cb8ce7f..14f6c15 100644
+index cb8ce7f..c68a23b 100644
 --- a/libswc/compositor.c
 +++ b/libswc/compositor.c
 @@ -43,6 +43,7 @@
@@ -21,7 +21,66 @@ index cb8ce7f..14f6c15 100644
  		return;
  	}
  
-@@ -400,7 +403,11 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
+@@ -265,7 +268,10 @@ repaint_view(struct target *target, struct compositor_view *view,
+ 	    (int64_t)view->border.outwidth + (int64_t)view->border.inwidth;
+ 	pixman_region32_init_rect(&geom_region, geom->x, geom->y, geom->width,
+ 	                          geom->height);
+-	if (view->window) {
++	if (view->window ||
++	    (view->surface && surface_viewport_active(view->surface))) {
++		/* The buffer covers the whole geometry: exactly for windows, and
++		 * by scaling for viewport surfaces. */
+ 		pixman_region32_init_rect(&buffer_region, geom->x, geom->y, geom->width,
+ 		                          geom->height);
+ 	} else {
+@@ -287,11 +293,41 @@ repaint_view(struct target *target, struct compositor_view *view,
+ 	pixman_region32_intersect(&buffer_damage, &view_damage, &buffer_region);
+ 
+ 	if (pixman_region32_not_empty(&buffer_damage)) {
+-		pixman_region32_translate(&buffer_damage,
+-		                          -geom->x + view->buffer_offset_x,
+-		                          -geom->y + view->buffer_offset_y);
+-		wld_copy_region(swc.drm->renderer, view->buffer, buf_x - target_geom->x,
+-		                buf_y - target_geom->y, &buffer_damage);
++		double src_x, src_y, src_width, src_height;
++
++		if (view->surface &&
++		    surface_viewport_src(view->surface, view->base.buffer,
++		                         &src_x, &src_y, &src_width, &src_height)) {
++			/* Viewport: composite the source rectangle scaled onto the
++			 * view geometry, clipped to the damaged area.  The clip is in
++			 * target coordinates: global minus the target origin. */
++			pixman_region32_translate(&buffer_damage,
++			                          -target_geom->x, -target_geom->y);
++			if (!wld_copy_scaled(swc.drm->renderer, view->buffer,
++			                     src_x, src_y, src_width, src_height,
++			                     geom->x - target_geom->x,
++			                     geom->y - target_geom->y,
++			                     geom->width, geom->height,
++			                     &buffer_damage)) {
++				/* Renderer without scaling support: blit unscaled.
++				 * target coords -> buffer coords. */
++				pixman_region32_translate(&buffer_damage,
++				                          target_geom->x - geom->x +
++				                              view->buffer_offset_x,
++				                          target_geom->y - geom->y +
++				                              view->buffer_offset_y);
++				wld_copy_region(swc.drm->renderer, view->buffer,
++				                buf_x - target_geom->x,
++				                buf_y - target_geom->y, &buffer_damage);
++			}
++		} else {
++			pixman_region32_translate(&buffer_damage,
++			                          -geom->x + view->buffer_offset_x,
++			                          -geom->y + view->buffer_offset_y);
++			wld_copy_region(swc.drm->renderer, view->buffer,
++			                buf_x - target_geom->x,
++			                buf_y - target_geom->y, &buffer_damage);
++		}
+ 	}
+ 
+ 	pixman_region32_fini(&view_damage);
+@@ -400,7 +436,11 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
  	      target->view->geometry.x, target->view->geometry.y,
  	      target->view->geometry.width, target->view->geometry.height);
  
@@ -34,7 +93,24 @@ index cb8ce7f..14f6c15 100644
  
  	if (pixman_region32_not_empty(base_damage)) {
  		pixman_region32_translate(base_damage, -target->view->geometry.x,
-@@ -996,8 +1003,9 @@ move(struct view *base, int32_t x, int32_t y)
+@@ -954,6 +994,16 @@ attach(struct view *base, struct wld_buffer *buffer)
+ 			view->buffer_offset_y = surface->window_y;
+ 		}
+ 	}
++	/* wp_viewporter: the surface size is the viewport destination (or the
++	 * source size), independent of the buffer dimensions. */
++	if (surface && buffer) {
++		uint32_t vp_width, vp_height;
++
++		if (surface_viewport_size(surface, &vp_width, &vp_height)) {
++			new_width = vp_width;
++			new_height = vp_height;
++		}
++	}
+ 
+ 	if (view_set_size(&view->base, new_width, new_height)) {
+ 		/* The view was resized. */
+@@ -996,8 +1046,9 @@ move(struct view *base, int32_t x, int32_t y)
  
  		if (view->visible) {
  			/* Assume worst-case no clipping until we draw the next frame (in
@@ -46,7 +122,7 @@ index cb8ce7f..14f6c15 100644
  
  			view_update_screens(&view->base);
  			damage_below_view(view);
-@@ -1355,9 +1363,31 @@ compositor_create_view(struct surface *surface)
+@@ -1355,9 +1406,31 @@ compositor_create_view(struct surface *surface)
  void
  compositor_view_destroy(struct compositor_view *view)
  {
@@ -78,7 +154,7 @@ index cb8ce7f..14f6c15 100644
  	view_finalize(&view->base);
  	decor_view_finalize(view);
  	pixman_region32_fini(&view->clip);
-@@ -1377,6 +1407,11 @@ compositor_view_set_parent(struct compositor_view *view,
+@@ -1377,6 +1450,11 @@ compositor_view_set_parent(struct compositor_view *view,
  {
  	view->parent = parent;
  
@@ -90,7 +166,7 @@ index cb8ce7f..14f6c15 100644
  	if (parent->visible) {
  		compositor_view_show(view);
  	} else {
-@@ -1412,7 +1447,7 @@ compositor_view_restack(struct compositor_view *view,
+@@ -1412,7 +1490,7 @@ compositor_view_restack(struct compositor_view *view,
  void
  compositor_view_show(struct compositor_view *view)
  {
@@ -99,7 +175,7 @@ index cb8ce7f..14f6c15 100644
  	struct subsurface *subsurface;
  
  	if (view->visible) {
-@@ -1439,7 +1474,9 @@ compositor_view_show(struct compositor_view *view)
+@@ -1439,7 +1517,9 @@ compositor_view_show(struct compositor_view *view)
  	damage_view(view);
  	update(&view->base);
  
@@ -110,7 +186,7 @@ index cb8ce7f..14f6c15 100644
  	{
  		if (other->parent == view) {
  			compositor_view_show(other);
-@@ -1450,7 +1487,7 @@ compositor_view_show(struct compositor_view *view)
+@@ -1450,7 +1530,7 @@ compositor_view_show(struct compositor_view *view)
  void
  compositor_view_hide(struct compositor_view *view)
  {
@@ -119,7 +195,7 @@ index cb8ce7f..14f6c15 100644
  
  	if (!view->visible) {
  		return;
-@@ -1463,7 +1500,7 @@ compositor_view_hide(struct compositor_view *view)
+@@ -1463,7 +1543,7 @@ compositor_view_hide(struct compositor_view *view)
  	view_set_screens(&view->base, 0);
  	view->visible = false;
  
@@ -169,6 +245,123 @@ index cd6eb82..9937006 100644
  		drm.global = wl_global_create(swc.display, &wl_drm_interface, 2, NULL,
  		                              &bind_drm);
  		if (!drm.global) {
+diff --git a/libswc/fractional_scale.c b/libswc/fractional_scale.c
+new file mode 100644
+index 0000000..7d6aba0
+--- /dev/null
++++ b/libswc/fractional_scale.c
+@@ -0,0 +1,83 @@
++/* swc: libswc/fractional_scale.c
++ *
++ * Minimal wp_fractional_scale_manager_v1: swc has no output scaling, so
++ * every surface is told the preferred scale is 1.0 (120/120).  This exists
++ * because some clients (e.g. swww) refuse to start without the global.
++ */
++
++#include "fractional_scale.h"
++#include "internal.h"
++
++#include <stdlib.h>
++#include <wayland-server.h>
++#include "fractional-scale-v1-server-protocol.h"
++
++static void
++fractional_scale_destroy(struct wl_client *client, struct wl_resource *resource)
++{
++	(void)client;
++	wl_resource_destroy(resource);
++}
++
++static const struct wp_fractional_scale_v1_interface fractional_scale_impl = {
++	.destroy = fractional_scale_destroy,
++};
++
++static void
++manager_destroy(struct wl_client *client, struct wl_resource *resource)
++{
++	(void)client;
++	wl_resource_destroy(resource);
++}
++
++static void
++manager_get_fractional_scale(struct wl_client *client,
++                             struct wl_resource *resource, uint32_t id,
++                             struct wl_resource *surface_resource)
++{
++	struct wl_resource *scale_resource;
++
++	(void)surface_resource;
++
++	scale_resource =
++	    wl_resource_create(client, &wp_fractional_scale_v1_interface,
++	                       wl_resource_get_version(resource), id);
++	if (!scale_resource) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++	wl_resource_set_implementation(scale_resource, &fractional_scale_impl,
++	                               NULL, NULL);
++	/* Scale is in 120ths: 120 == 1.0. */
++	wp_fractional_scale_v1_send_preferred_scale(scale_resource, 120);
++}
++
++static const struct wp_fractional_scale_manager_v1_interface manager_impl = {
++	.destroy = manager_destroy,
++	.get_fractional_scale = manager_get_fractional_scale,
++};
++
++static void
++bind_manager(struct wl_client *client, void *data, uint32_t version,
++             uint32_t id)
++{
++	struct wl_resource *resource;
++
++	(void)data;
++
++	resource = wl_resource_create(
++	    client, &wp_fractional_scale_manager_v1_interface, version, id);
++	if (!resource) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++	wl_resource_set_implementation(resource, &manager_impl, NULL, NULL);
++}
++
++struct wl_global *
++fractional_scale_manager_create(struct wl_display *display)
++{
++	return wl_global_create(display,
++	                        &wp_fractional_scale_manager_v1_interface, 1,
++	                        NULL, &bind_manager);
++}
+diff --git a/libswc/fractional_scale.h b/libswc/fractional_scale.h
+new file mode 100644
+index 0000000..f3353ec
+--- /dev/null
++++ b/libswc/fractional_scale.h
+@@ -0,0 +1,9 @@
++#ifndef SWC_FRACTIONAL_SCALE_H
++#define SWC_FRACTIONAL_SCALE_H
++
++struct wl_display;
++struct wl_global;
++
++struct wl_global *fractional_scale_manager_create(struct wl_display *display);
++
++#endif
+diff --git a/libswc/internal.h b/libswc/internal.h
+index 2b69383..7e3cb82 100644
+--- a/libswc/internal.h
++++ b/libswc/internal.h
+@@ -56,6 +56,8 @@ struct swc {
+ 	struct wl_global *xdg_decoration_manager;
+ 	struct wl_global *xdg_output_manager;
+ 	struct wl_global *xdg_shell;
++	struct wl_global *viewporter;
++	struct wl_global *fractional_scale_manager;
+ 
+ #ifdef ENABLE_XWAYLAND
+ 	const struct swc_xserver *const xserver;
 diff --git a/libswc/keyboard.c b/libswc/keyboard.c
 index 2a0b284..89b7acb 100644
 --- a/libswc/keyboard.c
@@ -303,6 +496,19 @@ index caa34fc..af9b1f2 100644
  	layer_surface->view_handler.impl = &view_handler_impl;
  	layer_surface->modifier.modify = modify;
  	wl_list_init(&layer_surface->modifier.link);
+diff --git a/libswc/meson.build b/libswc/meson.build
+index 0aaa23f..679ec68 100644
+--- a/libswc/meson.build
++++ b/libswc/meson.build
+@@ -36,6 +36,8 @@ libswc_src = files(
+   'view.c',
+   'wayland_buffer.c',
+   'window.c',
++  'viewport.c',
++  'fractional_scale.c',
+   'xdg_decoration.c',
+   'xdg_output.c',
+   'xdg_shell.c',
 diff --git a/libswc/output.c b/libswc/output.c
 index 8b26ae4..608ca2e 100644
 --- a/libswc/output.c
@@ -462,7 +668,7 @@ index b99ef2a..8cf52c3 100644
  	                            surface, parent);
  
 diff --git a/libswc/surface.c b/libswc/surface.c
-index 54479be..6efd8fe 100644
+index 54479be..6e73116 100644
 --- a/libswc/surface.c
 +++ b/libswc/surface.c
 @@ -22,6 +22,7 @@
@@ -473,7 +679,100 @@ index 54479be..6efd8fe 100644
  #include "event.h"
  #include "internal.h"
  #include "output.h"
-@@ -397,7 +398,19 @@ surface_destroy(struct wl_resource *resource)
+@@ -244,12 +245,72 @@ set_input_region(struct wl_client *client, struct wl_resource *resource,
+ 	}
+ }
+ 
++bool
++surface_viewport_active(struct surface *surface)
++{
++	return surface != NULL &&
++	    (surface->viewport.has_src || surface->viewport.has_dst);
++}
++
++bool
++surface_viewport_src(struct surface *surface, struct wld_buffer *buffer,
++                     double *x, double *y, double *width, double *height)
++{
++	if (!surface_viewport_active(surface)) {
++		return false;
++	}
++	if (surface->viewport.has_src) {
++		*x = surface->viewport.src_x;
++		*y = surface->viewport.src_y;
++		*width = surface->viewport.src_width;
++		*height = surface->viewport.src_height;
++	} else {
++		*x = 0.0;
++		*y = 0.0;
++		*width = buffer ? (double)buffer->width : 0.0;
++		*height = buffer ? (double)buffer->height : 0.0;
++	}
++	return true;
++}
++
++bool
++surface_viewport_size(struct surface *surface, uint32_t *width,
++                      uint32_t *height)
++{
++	if (!surface_viewport_active(surface)) {
++		return false;
++	}
++	if (surface->viewport.has_dst) {
++		*width = (uint32_t)surface->viewport.dst_width;
++		*height = (uint32_t)surface->viewport.dst_height;
++	} else {
++		/* Source only: the surface size is the (integer) source size. */
++		*width = (uint32_t)(surface->viewport.src_width + 0.5);
++		*height = (uint32_t)(surface->viewport.src_height + 0.5);
++	}
++	return *width > 0 && *height > 0;
++}
++
++/* Surface-coordinate size: viewport destination when set, else buffer size. */
++static void
++surface_coord_size(struct surface *surface, struct wld_buffer *buffer,
++                   uint32_t *width, uint32_t *height)
++{
++	if (surface_viewport_size(surface, width, height)) {
++		return;
++	}
++	*width = buffer ? buffer->width : 0;
++	*height = buffer ? buffer->height : 0;
++}
++
+ static inline void
+-trim_region(pixman_region32_t *region, struct wld_buffer *buffer)
++trim_region(pixman_region32_t *region, struct surface *surface,
++            struct wld_buffer *buffer)
+ {
+-	pixman_region32_intersect_rect(region, region, 0, 0,
+-	                               buffer ? buffer->width : 0,
+-	                               buffer ? buffer->height : 0);
++	uint32_t width, height;
++
++	surface_coord_size(surface, buffer, &width, &height);
++	pixman_region32_intersect_rect(region, region, 0, 0, width, height);
+ }
+ 
+ static void
+@@ -296,8 +357,13 @@ surface_apply_pending(struct surface *surface, bool flush_children)
+ 		wl_list_init(&surface->pending.state.frame_callbacks);
+ 	}
+ 
+-	trim_region(&surface->state.damage, buffer);
+-	trim_region(&surface->state.opaque, buffer);
++	/* Viewport state is double-buffered; latch it before trimming so the
++	 * damage/opaque regions are clipped to the (possibly scaled) surface
++	 * size rather than the raw buffer size. */
++	surface->viewport = surface->viewport_pending;
++
++	trim_region(&surface->state.damage, surface, buffer);
++	trim_region(&surface->state.opaque, surface, buffer);
+ 
+ 	if (surface->view) {
+ 		if (surface->pending.commit & SURFACE_COMMIT_ATTACH) {
+@@ -397,7 +463,19 @@ surface_destroy(struct wl_resource *resource)
  	state_finalize(&surface->pending.state);
  
  	if (surface->view) {
@@ -494,11 +793,80 @@ index 54479be..6efd8fe 100644
  	}
  	if (surface->role) {
  		wl_list_remove(&surface->role_destroy_listener.link);
+@@ -446,6 +524,9 @@ surface_new(struct wl_client *client, uint32_t version, uint32_t id)
+ 	surface->window_width = 0;
+ 	surface->window_height = 0;
+ 	surface->window_geometry_applied = false;
++	memset(&surface->viewport, 0, sizeof(surface->viewport));
++	memset(&surface->viewport_pending, 0, sizeof(surface->viewport_pending));
++	surface->viewport_resource = NULL;
+ 
+ 	state_initialize(&surface->state);
+ 	state_initialize(&surface->pending.state);
+diff --git a/libswc/surface.h b/libswc/surface.h
+index 3f62326..81a91a0 100644
+--- a/libswc/surface.h
++++ b/libswc/surface.h
+@@ -60,6 +60,15 @@ struct surface_state {
+ 	struct wl_list subsurfaces_above;
+ };
+ 
++/* wp_viewporter crop/scale state.  Double-buffered: `pending` is written by
++ * the wp_viewport requests and copied to the current state on commit. */
++struct surface_viewport_state {
++	bool has_src;
++	double src_x, src_y, src_width, src_height;
++	bool has_dst;
++	int32_t dst_width, dst_height;
++};
++
+ struct surface {
+ 	struct wl_resource *resource;
+ 	struct {
+@@ -74,6 +83,9 @@ struct surface {
+ 		int32_t x, y;
+ 	} pending;
+ 
++	struct surface_viewport_state viewport, viewport_pending;
++	struct wl_resource *viewport_resource;
++
+ 	struct view *view;
+ 	struct view_handler view_handler;
+ 	struct wl_resource *role;
+@@ -98,4 +110,19 @@ surface_has_buffer(struct surface *surface);
+ void
+ surface_commit_pending(struct surface *surface);
+ 
++/* Whether the committed viewport state affects this surface. */
++bool
++surface_viewport_active(struct surface *surface);
++/* Source rectangle (buffer coordinates) the committed viewport selects;
++ * defaults to the full buffer when only a destination is set.  Returns false
++ * when no viewport state is active. */
++bool
++surface_viewport_src(struct surface *surface, struct wld_buffer *buffer,
++                     double *x, double *y, double *width, double *height);
++/* Surface size in surface coordinates given viewport state; returns false
++ * when the buffer size should be used as-is. */
++bool
++surface_viewport_size(struct surface *surface, uint32_t *width,
++                      uint32_t *height);
++
+ #endif
 diff --git a/libswc/swc.c b/libswc/swc.c
-index 4ae726f..4aadc85 100644
+index 4ae726f..f6d05ca 100644
 --- a/libswc/swc.c
 +++ b/libswc/swc.c
-@@ -144,6 +144,24 @@ swc_cursor_position(int32_t *x, int32_t *y)
+@@ -45,6 +45,8 @@
+ #include "window.h"
+ #include "xdg_decoration.h"
+ #include "xdg_output.h"
++#include "viewport.h"
++#include "fractional_scale.h"
+ #include "xdg_shell.h"
+ #ifdef ENABLE_XWAYLAND
+ #include "xserver.h"
+@@ -144,6 +146,24 @@ swc_cursor_position(int32_t *x, int32_t *y)
  	return true;
  }
  
@@ -523,6 +891,34 @@ index 4ae726f..4aadc85 100644
  EXPORT bool
  swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
                 const struct swc_manager *manager)
+@@ -265,6 +285,18 @@ swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
+ 		goto error17;
+ 	}
+ 
++	swc.viewporter = viewporter_create(display);
++	if (!swc.viewporter) {
++		ERROR("Could not initialize viewporter\n");
++		goto error17;
++	}
++
++	swc.fractional_scale_manager = fractional_scale_manager_create(display);
++	if (!swc.fractional_scale_manager) {
++		ERROR("Could not initialize fractional scale manager\n");
++		goto error17;
++	}
++
+ 	setup_compositor();
+ 
+ 	return true;
+@@ -315,6 +347,8 @@ swc_finalize(void)
+ #ifdef ENABLE_XWAYLAND
+ 	xserver_finalize();
+ #endif
++	wl_global_destroy(swc.fractional_scale_manager);
++	wl_global_destroy(swc.viewporter);
+ 	wl_global_destroy(swc.xdg_output_manager);
+ 	wl_global_destroy(swc.snap_manager);
+ 	wl_global_destroy(swc.select_manager);
 diff --git a/libswc/swc.h b/libswc/swc.h
 index 80b49f0..f04ae30 100644
 --- a/libswc/swc.h
@@ -577,6 +973,231 @@ index 05c30e5..a8ad07f 100644
  	if (view->buffer) {
  		wld_buffer_unreference(view->buffer);
  	}
+diff --git a/libswc/viewport.c b/libswc/viewport.c
+new file mode 100644
+index 0000000..a77b15b
+--- /dev/null
++++ b/libswc/viewport.c
+@@ -0,0 +1,204 @@
++/* swc: libswc/viewport.c
++ *
++ * wp_viewporter implementation: per-surface crop (source rectangle) and
++ * scale (destination size).  State lives in struct surface (double-buffered,
++ * latched on commit); the actual scaling happens in the compositor repaint
++ * path via wld_copy_scaled.
++ */
++
++#include "viewport.h"
++#include "internal.h"
++#include "surface.h"
++#include "util.h"
++
++#include <stdlib.h>
++#include <wayland-server.h>
++#include "viewporter-server-protocol.h"
++
++struct viewport {
++	struct wl_resource *resource;
++	struct surface *surface;
++	struct wl_listener surface_destroy_listener;
++};
++
++static void
++destroy_viewport_resource(struct wl_resource *resource)
++{
++	struct viewport *viewport = wl_resource_get_user_data(resource);
++
++	if (viewport->surface) {
++		/* Per spec, destroying the viewport removes crop/scale state;
++		 * it takes effect on the next commit. */
++		viewport->surface->viewport_pending.has_src = false;
++		viewport->surface->viewport_pending.has_dst = false;
++		viewport->surface->viewport_resource = NULL;
++		wl_list_remove(&viewport->surface_destroy_listener.link);
++	}
++	free(viewport);
++}
++
++static void
++handle_surface_destroy(struct wl_listener *listener, void *data)
++{
++	struct viewport *viewport =
++	    wl_container_of(listener, viewport, surface_destroy_listener);
++
++	(void)data;
++
++	/* The viewport object becomes inert. */
++	wl_list_remove(&viewport->surface_destroy_listener.link);
++	viewport->surface = NULL;
++}
++
++static void
++viewport_destroy(struct wl_client *client, struct wl_resource *resource)
++{
++	(void)client;
++	wl_resource_destroy(resource);
++}
++
++static void
++viewport_set_source(struct wl_client *client, struct wl_resource *resource,
++                    wl_fixed_t x, wl_fixed_t y,
++                    wl_fixed_t width, wl_fixed_t height)
++{
++	struct viewport *viewport = wl_resource_get_user_data(resource);
++	double dx = wl_fixed_to_double(x), dy = wl_fixed_to_double(y);
++	double dw = wl_fixed_to_double(width), dh = wl_fixed_to_double(height);
++
++	(void)client;
++
++	if (!viewport->surface) {
++		wl_resource_post_error(resource, WP_VIEWPORT_ERROR_NO_SURFACE,
++		                       "the wl_surface was destroyed");
++		return;
++	}
++
++	if (dw == -1.0 && dh == -1.0) {
++		viewport->surface->viewport_pending.has_src = false;
++		return;
++	}
++	if (dw <= 0.0 || dh <= 0.0 || dx < 0.0 || dy < 0.0) {
++		wl_resource_post_error(resource, WP_VIEWPORT_ERROR_BAD_VALUE,
++		                       "invalid source rectangle");
++		return;
++	}
++
++	viewport->surface->viewport_pending.has_src = true;
++	viewport->surface->viewport_pending.src_x = dx;
++	viewport->surface->viewport_pending.src_y = dy;
++	viewport->surface->viewport_pending.src_width = dw;
++	viewport->surface->viewport_pending.src_height = dh;
++}
++
++static void
++viewport_set_destination(struct wl_client *client,
++                         struct wl_resource *resource,
++                         int32_t width, int32_t height)
++{
++	struct viewport *viewport = wl_resource_get_user_data(resource);
++
++	(void)client;
++
++	if (!viewport->surface) {
++		wl_resource_post_error(resource, WP_VIEWPORT_ERROR_NO_SURFACE,
++		                       "the wl_surface was destroyed");
++		return;
++	}
++
++	if (width == -1 && height == -1) {
++		viewport->surface->viewport_pending.has_dst = false;
++		return;
++	}
++	if (width <= 0 || height <= 0) {
++		wl_resource_post_error(resource, WP_VIEWPORT_ERROR_BAD_VALUE,
++		                       "invalid destination size");
++		return;
++	}
++
++	viewport->surface->viewport_pending.has_dst = true;
++	viewport->surface->viewport_pending.dst_width = width;
++	viewport->surface->viewport_pending.dst_height = height;
++}
++
++static const struct wp_viewport_interface viewport_impl = {
++	.destroy = viewport_destroy,
++	.set_source = viewport_set_source,
++	.set_destination = viewport_set_destination,
++};
++
++/* wp_viewporter */
++
++static void
++viewporter_destroy(struct wl_client *client, struct wl_resource *resource)
++{
++	(void)client;
++	wl_resource_destroy(resource);
++}
++
++static void
++viewporter_get_viewport(struct wl_client *client, struct wl_resource *resource,
++                        uint32_t id, struct wl_resource *surface_resource)
++{
++	struct surface *surface = wl_resource_get_user_data(surface_resource);
++	struct viewport *viewport;
++
++	if (surface->viewport_resource) {
++		wl_resource_post_error(resource,
++		                       WP_VIEWPORTER_ERROR_VIEWPORT_EXISTS,
++		                       "surface already has a viewport");
++		return;
++	}
++
++	viewport = calloc(1, sizeof(*viewport));
++	if (!viewport) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++
++	viewport->resource =
++	    wl_resource_create(client, &wp_viewport_interface,
++	                       wl_resource_get_version(resource), id);
++	if (!viewport->resource) {
++		free(viewport);
++		wl_client_post_no_memory(client);
++		return;
++	}
++
++	viewport->surface = surface;
++	viewport->surface_destroy_listener.notify = handle_surface_destroy;
++	wl_resource_add_destroy_listener(surface->resource,
++	                                 &viewport->surface_destroy_listener);
++	surface->viewport_resource = viewport->resource;
++	wl_resource_set_implementation(viewport->resource, &viewport_impl,
++	                               viewport, &destroy_viewport_resource);
++}
++
++static const struct wp_viewporter_interface viewporter_impl = {
++	.destroy = viewporter_destroy,
++	.get_viewport = viewporter_get_viewport,
++};
++
++static void
++bind_viewporter(struct wl_client *client, void *data, uint32_t version,
++                uint32_t id)
++{
++	struct wl_resource *resource;
++
++	(void)data;
++
++	resource = wl_resource_create(client, &wp_viewporter_interface,
++	                              version, id);
++	if (!resource) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++	wl_resource_set_implementation(resource, &viewporter_impl, NULL, NULL);
++}
++
++struct wl_global *
++viewporter_create(struct wl_display *display)
++{
++	return wl_global_create(display, &wp_viewporter_interface, 1, NULL,
++	                        &bind_viewporter);
++}
+diff --git a/libswc/viewport.h b/libswc/viewport.h
+new file mode 100644
+index 0000000..57edc4c
+--- /dev/null
++++ b/libswc/viewport.h
+@@ -0,0 +1,9 @@
++#ifndef SWC_VIEWPORT_H
++#define SWC_VIEWPORT_H
++
++struct wl_display;
++struct wl_global;
++
++struct wl_global *viewporter_create(struct wl_display *display);
++
++#endif
 diff --git a/libswc/window.c b/libswc/window.c
 index 19a9897..868bf18 100644
 --- a/libswc/window.c
@@ -688,3 +1309,16 @@ index 46b841f..76fc848 100644
  		       "-wm", strings[1], NULL);
  		#endif
  
+diff --git a/protocol/meson.build b/protocol/meson.build
+index c6a0e63..b11a720 100644
+--- a/protocol/meson.build
++++ b/protocol/meson.build
+@@ -13,6 +13,8 @@ foreach proto : [
+   wl.find_protocol('linux-dmabuf', state: 'unstable', version: 1),
+   wl.find_protocol('xdg-decoration', state: 'unstable', version: 1),
+   wl.find_protocol('xdg-output', state: 'unstable', version: 1),
++  wl.find_protocol('viewporter', state: 'stable'),
++  wl.find_protocol('fractional-scale', state: 'staging', version: 1),
+ ]
+   protocols = wl.scan_xml(proto,
+     public: true,

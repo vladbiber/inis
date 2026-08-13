@@ -1,8 +1,100 @@
+diff --git a/interface/renderer.h b/interface/renderer.h
+index ed34b3d..2422319 100644
+--- a/interface/renderer.h
++++ b/interface/renderer.h
+@@ -42,6 +42,15 @@ static void renderer_copy_region(struct wld_renderer *base,
+                                  int32_t dst_x, int32_t dst_y,
+                                  pixman_region32_t *region);
+ #endif
++#ifdef RENDERER_IMPLEMENTS_SCALED
++static void renderer_copy_scaled(struct wld_renderer *base,
++                                 struct buffer *buffer,
++                                 double src_x, double src_y,
++                                 double src_width, double src_height,
++                                 int32_t dst_x, int32_t dst_y,
++                                 uint32_t dst_width, uint32_t dst_height,
++                                 pixman_region32_t *clip);
++#endif
+ static void renderer_draw_text(struct wld_renderer *renderer,
+                                struct font *font, uint32_t color,
+                                int32_t x, int32_t y,
+@@ -61,6 +70,9 @@ static const struct wld_renderer_impl wld_renderer_impl = {
+ #else
+ 	.fill_region = &default_fill_region,
+ 	.copy_region = &default_copy_region,
++#endif
++#ifdef RENDERER_IMPLEMENTS_SCALED
++	.copy_scaled = &renderer_copy_scaled,
+ #endif
+ 	.draw_circle = &wld_draw_circle,
+ 	.draw_line = &wld_draw_line,
 diff --git a/pixman.c b/pixman.c
-index ed7788f..cb91bb9 100644
+index ed7788f..f45b9d7 100644
 --- a/pixman.c
 +++ b/pixman.c
-@@ -326,7 +326,18 @@ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
+@@ -53,6 +53,7 @@ struct pixman_map {
+ 
+ #include "interface/context.h"
+ #define RENDERER_IMPLEMENTS_REGION
++#define RENDERER_IMPLEMENTS_SCALED
+ #include "interface/buffer.h"
+ #include "interface/renderer.h"
+ IMPL(pixman_renderer, wld_renderer)
+@@ -309,6 +310,53 @@ renderer_copy_rectangle(struct wld_renderer *base, struct buffer *buffer,
+ 	pixman_image_unref(src);
+ }
+ 
++static void
++renderer_copy_scaled(struct wld_renderer *base, struct buffer *buffer,
++                     double src_x, double src_y,
++                     double src_width, double src_height,
++                     int32_t dst_x, int32_t dst_y,
++                     uint32_t dst_width, uint32_t dst_height,
++                     pixman_region32_t *clip)
++{
++	struct pixman_renderer *renderer = pixman_renderer(base);
++	pixman_image_t *src = pixman_image(buffer), *dst = renderer->target;
++	pixman_transform_t transform;
++
++	if (!src) {
++		return;
++	}
++	if (dst_width == 0 || dst_height == 0 ||
++	    src_width <= 0.0 || src_height <= 0.0) {
++		pixman_image_unref(src);
++		return;
++	}
++
++	/* dst -> src mapping: src = src_origin + dst * (src_size / dst_size). */
++	memset(&transform, 0, sizeof(transform));
++	transform.matrix[0][0] = pixman_double_to_fixed(src_width / dst_width);
++	transform.matrix[1][1] = pixman_double_to_fixed(src_height / dst_height);
++	transform.matrix[0][2] = pixman_double_to_fixed(src_x);
++	transform.matrix[1][2] = pixman_double_to_fixed(src_y);
++	transform.matrix[2][2] = pixman_fixed_1;
++
++	pixman_image_set_transform(src, &transform);
++	pixman_image_set_filter(src, PIXMAN_FILTER_BILINEAR, NULL, 0);
++	if (clip) {
++		pixman_image_set_clip_region32(dst, clip);
++	}
++	/* OVER for the same blending reasons as renderer_copy_region. */
++	pixman_image_composite32(PIXMAN_OP_OVER, src, NULL, dst, 0, 0, 0, 0,
++	                         dst_x, dst_y, dst_width, dst_height);
++	if (clip) {
++		pixman_image_set_clip_region32(dst, NULL);
++	}
++	/* The pixman image is cached on the buffer — restore its defaults so
++	 * unscaled paths are unaffected. */
++	pixman_image_set_transform(src, NULL);
++	pixman_image_set_filter(src, PIXMAN_FILTER_NEAREST, NULL, 0);
++	pixman_image_unref(src);
++}
++
+ void
+ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
+                      int32_t dst_x, int32_t dst_y,
+@@ -326,7 +374,18 @@ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
  	pixman_region32_translate(&clip, dst_x, dst_y);
  
  	pixman_image_set_clip_region32(dst, &clip);
@@ -22,3 +114,80 @@ index ed7788f..cb91bb9 100644
  	                         region->extents.x1, region->extents.y1, 0, 0,
  	                         region->extents.x1 + dst_x,
  	                         region->extents.y1 + dst_y,
+diff --git a/renderer.c b/renderer.c
+index 2f49bc8..bf3dbb5 100644
+--- a/renderer.c
++++ b/renderer.c
+@@ -143,6 +143,25 @@ wld_copy_region(struct wld_renderer *renderer,
+ 	                            dst_x, dst_y, region);
+ }
+ 
++EXPORT
++bool
++wld_copy_scaled(struct wld_renderer *renderer,
++                struct wld_buffer *buffer,
++                double src_x, double src_y,
++                double src_width, double src_height,
++                int32_t dst_x, int32_t dst_y,
++                uint32_t dst_width, uint32_t dst_height,
++                pixman_region32_t *clip)
++{
++	if (!renderer->impl->copy_scaled) {
++		return false;
++	}
++	renderer->impl->copy_scaled(renderer, (struct buffer *)buffer,
++	                            src_x, src_y, src_width, src_height,
++	                            dst_x, dst_y, dst_width, dst_height, clip);
++	return true;
++}
++
+ EXPORT
+ void
+ wld_blend_region(struct wld_renderer *renderer, struct wld_buffer *buffer,
+diff --git a/wld-private.h b/wld-private.h
+index 5a02630..bc470f9 100644
+--- a/wld-private.h
++++ b/wld-private.h
+@@ -108,6 +108,15 @@ struct wld_renderer_impl {
+ 	void (*copy_region)(struct wld_renderer *renderer, struct buffer *src,
+ 	                    int32_t dst_x, int32_t dst_y,
+ 	                    pixman_region32_t *region);
++	/* Optional (may be NULL): composite src cropped to the given source
++	 * rectangle, scaled onto dst_x,dst_y dst_width x dst_height, clipped to
++	 * `clip` (in target coordinates).  Needed for wp_viewporter. */
++	void (*copy_scaled)(struct wld_renderer *renderer, struct buffer *src,
++	                    double src_x, double src_y,
++	                    double src_width, double src_height,
++	                    int32_t dst_x, int32_t dst_y,
++	                    uint32_t dst_width, uint32_t dst_height,
++	                    pixman_region32_t *clip);
+ 	void (*draw_circle)(struct wld_renderer *renderer, uint32_t color,
+ 				int32_t x, int32_t y, uint32_t r, bool fill);
+ 	void (*draw_line)(struct wld_renderer *renderer, uint32_t color,
+diff --git a/wld.h b/wld.h
+index 8191ae3..02cbf2d 100644
+--- a/wld.h
++++ b/wld.h
+@@ -253,6 +253,22 @@ void wld_copy_region(struct wld_renderer *renderer,
+                      struct wld_buffer *buffer,
+                      int32_t dst_x, int32_t dst_y, pixman_region32_t *region);
+ 
++/**
++ * Composite the source rectangle (src_x, src_y, src_width, src_height) of the
++ * buffer scaled onto the target at (dst_x, dst_y, dst_width, dst_height),
++ * clipped to `clip` (target coordinates; may be NULL).
++ *
++ * Returns false when the renderer has no scaled-copy support; the caller
++ * should fall back to an unscaled copy.
++ */
++bool wld_copy_scaled(struct wld_renderer *renderer,
++                     struct wld_buffer *buffer,
++                     double src_x, double src_y,
++                     double src_width, double src_height,
++                     int32_t dst_x, int32_t dst_y,
++                     uint32_t dst_width, uint32_t dst_height,
++                     pixman_region32_t *clip);
++
+ void wld_blend_region(struct wld_renderer *renderer,
+                       struct wld_buffer *buffer,
+                       int32_t dst_x, int32_t dst_y,
