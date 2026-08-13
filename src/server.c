@@ -265,6 +265,37 @@ sync_window_layout_membership(struct inis_server *server, struct inis_window *wi
 	}
 }
 
+static void
+rebuild_workspace_layout(struct inis_server *server, size_t workspace_index)
+{
+	struct inis_workspace *workspace;
+	struct inis_window *focused;
+	size_t i;
+
+	if (server == NULL || workspace_index >= server->workspace_count)
+		return;
+
+	workspace = &server->workspaces[workspace_index];
+	focused = server->focused_window;
+	layout_finish_workspace(&workspace->layout);
+	sync_layout_config(server, workspace);
+
+	for (i = 0; i < server->window_count; i++) {
+		struct inis_window *window = &server->windows[i];
+
+		if (!window->mapped || window->workspace_index != workspace_index)
+			continue;
+		if (!window_should_be_tiled(server, window))
+			continue;
+		layout_add_view(&workspace->layout, &window->layout_view);
+	}
+
+	if (focused != NULL && focused->mapped &&
+	    focused->workspace_index == workspace_index &&
+	    focused->layout_view.workspace == &workspace->layout)
+		layout_focus_view(&workspace->layout, &focused->layout_view);
+}
+
 static struct inis_rect
 window_current_rect(const struct inis_server *server,
     const struct inis_window *window)
@@ -280,6 +311,45 @@ window_current_rect(const struct inis_server *server,
 	    window->state == INIS_WINDOW_FULLSCREEN)
 		return window->floating;
 	return window->tiled;
+}
+
+/*
+ * Recompute a monitor's effective usable area: start from the backend usable
+ * area and inset each edge by the space reserved for external bars.  Reserved
+ * insets are measured from the monitor geometry edges, so a top bar of height
+ * H reserves the topmost H pixels regardless of where the backend usable area
+ * begins.  If the reservations would leave nothing usable, they are ignored
+ * and the backend usable area is kept.
+ */
+static void
+monitor_recompute_usable(struct inis_monitor *monitor)
+{
+	const struct inis_rect *g = &monitor->geometry;
+	const struct inis_rect *b = &monitor->backend_usable;
+	int bx0 = b->x;
+	int by0 = b->y;
+	int bx1 = b->x + b->w;
+	int by1 = b->y + b->h;
+	int rx0 = g->x + monitor->reserved.left;
+	int ry0 = g->y + monitor->reserved.top;
+	int rx1 = g->x + g->w - monitor->reserved.right;
+	int ry1 = g->y + g->h - monitor->reserved.bottom;
+	int x0 = bx0 > rx0 ? bx0 : rx0;
+	int y0 = by0 > ry0 ? by0 : ry0;
+	int x1 = bx1 < rx1 ? bx1 : rx1;
+	int y1 = by1 < ry1 ? by1 : ry1;
+
+	if (x1 <= x0 || y1 <= y0) {
+		inis_warn("reserved insets exceed monitor %s usable area; ignoring",
+		    monitor->name);
+		monitor->usable = monitor->backend_usable;
+		return;
+	}
+
+	monitor->usable.x = x0;
+	monitor->usable.y = y0;
+	monitor->usable.w = x1 - x0;
+	monitor->usable.h = y1 - y0;
 }
 
 static struct inis_rect
@@ -357,6 +427,20 @@ damage_window(struct inis_server *server, const struct inis_window *window,
 }
 
 static void
+warp_pointer_to_window(struct inis_server *server, const struct inis_window *window)
+{
+	struct inis_rect rect;
+
+	if (server == NULL || window == NULL || !window->mapped)
+		return;
+	rect = window_current_rect(server, window);
+	if (rect.w <= 0 || rect.h <= 0)
+		return;
+	inis_backend_warp_pointer(&server->backend,
+	    rect.x + rect.w / 2, rect.y + rect.h / 2);
+}
+
+static void
 damage_monitor(struct inis_server *server, const struct inis_monitor *monitor,
     const char *reason)
 {
@@ -412,6 +496,33 @@ clamp_int(int value, int min, int max)
 	if (value > max)
 		return max;
 	return value;
+}
+
+static int
+abs_int(int value)
+{
+	return value < 0 ? -value : value;
+}
+
+static int
+rect_center_x(const struct inis_rect *rect)
+{
+	return rect->x + rect->w / 2;
+}
+
+static int
+rect_center_y(const struct inis_rect *rect)
+{
+	return rect->y + rect->h / 2;
+}
+
+static bool
+rects_overlap_on_secondary_axis(const struct inis_rect *a,
+    const struct inis_rect *b, enum wc_direction direction)
+{
+	if (direction == WC_DIRECTION_LEFT || direction == WC_DIRECTION_RIGHT)
+		return a->y < b->y + b->h && b->y < a->y + a->h;
+	return a->x < b->x + b->w && b->x < a->x + a->w;
 }
 
 static void
@@ -660,7 +771,12 @@ inis_server_add_monitor(struct inis_server *server, const char *name,
 	monitor = &server->monitors[server->monitor_count++];
 	inis_monitor_init(monitor, name);
 	monitor->geometry = *geometry;
-	monitor->usable = *usable;
+	monitor->backend_usable = *usable;
+	monitor->reserved.top = server->config.reserved_top;
+	monitor->reserved.bottom = server->config.reserved_bottom;
+	monitor->reserved.left = server->config.reserved_left;
+	monitor->reserved.right = server->config.reserved_right;
+	monitor_recompute_usable(monitor);
 	monitor->swc = backend_monitor;
 	monitor->active_workspace = 0;
 	if (server->focused_monitor == NULL)
@@ -734,6 +850,7 @@ inis_server_add_window(struct inis_server *server, const char *app_id,
 void
 inis_server_remove_window(struct inis_server *server, struct inis_window *window)
 {
+	size_t workspace_index;
 	size_t i;
 
 	if (window == NULL)
@@ -743,6 +860,7 @@ inis_server_remove_window(struct inis_server *server, struct inis_window *window
 	if (i >= server->window_count || !window->mapped)
 		return;
 
+	workspace_index = window->workspace_index;
 	if (window->workspace_index < server->workspace_count &&
 	    server->workspaces[window->workspace_index].window_count > 0)
 		server->workspaces[window->workspace_index].window_count--;
@@ -761,20 +879,22 @@ inis_server_remove_window(struct inis_server *server, struct inis_window *window
 	window->focused = false;
 	window->swc = NULL;
 
+	rebuild_workspace_layout(server, workspace_index);
+
 	/*
-	 * Do NOT try to re-focus another window here.  When a multi-window
-	 * client exits, libwayland fires all destroy callbacks synchronously.
-	 * Any candidate window might belong to the same dying client: its
-	 * wl_resources are already freed even though swc != NULL in our
-	 * tracking.  Calling swc_window_focus on such a window makes swc
-	 * write to a freed wl_keyboard resource — use-after-free crash.
-	 *
-	 * Clear the swc-level keyboard focus to NULL (safe — NULL means "no
-	 * focus", no resources accessed) and let arrange_idle_cb pick a new
-	 * focus window after all destroy callbacks in this batch have fired.
+	 * Do NOT call inis_backend_focus_window(backend, NULL) here.  This runs
+	 * inside swc's destroy handler (window_unmanage → handler->destroy),
+	 * which fires from the xdg_toplevel resource destructor.  swc's
+	 * swc_window_focus(NULL) unfocuses the current keyboard focus by calling
+	 * the outgoing window's unfocus impl, which sends an xdg configure on
+	 * toplevel->resource.  When a multi-window client (e.g. OBS) disconnects,
+	 * wl_client_destroy tears its resources down in arbitrary order, so the
+	 * focused sibling's toplevel resource may already be freed — posting the
+	 * configure is a use-after-free that crashes the whole session.  swc
+	 * clears keyboard focus safely by itself right after this handler, via
+	 * the view destroy signal (handle_focus_view_destroy), without sending
+	 * any event.  The idle arrange below picks the next focus target.
 	 */
-	if (server->focused_window == NULL)
-		inis_backend_focus_window(&server->backend, NULL);
 
 	/*
 	 * Defer arrange to the next event-loop idle.  When a multi-window
@@ -898,6 +1018,64 @@ apply_tiled_window:
 	raise_visible_non_tiled_windows(server);
 }
 
+/*
+ * Compute and apply a freshly mapped window's geometry synchronously, before
+ * it is shown.  In Wayland the client renders into whatever size the compositor
+ * configures it with; if we only set geometry in the deferred arrange (one
+ * event-loop tick later), the client has already committed a buffer at swc's
+ * default tiled size — the whole output — so the window flashes full-screen and
+ * then snaps to its tile.  An X11 WM like nvwm avoids this by resizing the
+ * window before mapping it; this is the Wayland equivalent: send the correct
+ * configure as part of the same iteration the window was created in.
+ *
+ * Only this one window is touched.  The full arrange (which would also
+ * re-configure the OTHER, already-mapped windows mid-configure and crash swc)
+ * stays deferred; the layout pass here is pure inis-side computation and writes
+ * swc geometry for the new window alone — its first configure, which is safe.
+ */
+void
+inis_server_preplace_window(struct inis_server *server,
+    struct inis_window *window)
+{
+	struct inis_workspace *workspace;
+	struct inis_rect usable;
+	struct wc_box area;
+
+	if (server == NULL || window == NULL || !window->mapped)
+		return;
+	if (window->workspace_index >= server->workspace_count)
+		return;
+
+	workspace = &server->workspaces[window->workspace_index];
+	usable = window_usable_area(server, window);
+
+	if (window->state == INIS_WINDOW_TILED &&
+	    !window_in_special_workspace(server, window) &&
+	    window->layout_view.workspace != NULL) {
+		sync_layout_config(server, workspace);
+		area.x = usable.x;
+		area.y = usable.y;
+		area.w = usable.w;
+		area.h = usable.h;
+		/*
+		 * Compute the layout WITHOUT changing the focused view, so the
+		 * geometry matches what the deferred arrange will produce (focus
+		 * only moves to this window later, after the settle delay).  This
+		 * keeps the pre-placed position pixel-identical to the final one,
+		 * so there is no second, smaller hop either.
+		 */
+		layout_arrange(&workspace->layout, area);
+		window->tiled.x = window->layout_view.pending_geometry.x;
+		window->tiled.y = window->layout_view.pending_geometry.y;
+		window->tiled.w = window->layout_view.pending_geometry.w;
+		window->tiled.h = window->layout_view.pending_geometry.h;
+	} else if (window->state == INIS_WINDOW_FLOATING) {
+		inis_window_ensure_floating_rect(window, &usable);
+	}
+
+	inis_backend_apply_window(&server->backend, window);
+}
+
 void
 inis_server_mark_damage(struct inis_server *server,
     const struct inis_rect *rect, const char *reason)
@@ -914,8 +1092,8 @@ inis_server_flush_damage(struct inis_server *server, const char *why)
 	inis_render_flush_damage(server, why);
 }
 
-int
-inis_server_focus_window(struct inis_server *server, struct inis_window *window)
+static int
+focus_window(struct inis_server *server, struct inis_window *window, bool warp)
 {
 	struct inis_window *old;
 
@@ -924,6 +1102,8 @@ inis_server_focus_window(struct inis_server *server, struct inis_window *window)
 	if (server->focused_window == window) {
 		if (window != NULL) {
 			inis_backend_focus_window(&server->backend, window);
+			if (warp)
+				warp_pointer_to_window(server, window);
 			if (window->state != INIS_WINDOW_TILED)
 				inis_backend_raise_window(&server->backend, window);
 		}
@@ -945,16 +1125,38 @@ inis_server_focus_window(struct inis_server *server, struct inis_window *window)
 			layout_focus_view(&server->workspaces[window->workspace_index].layout,
 			    &window->layout_view);
 		inis_backend_focus_window(&server->backend, window);
+		if (warp)
+			warp_pointer_to_window(server, window);
 		if (window->state != INIS_WINDOW_TILED)
 			inis_backend_raise_window(&server->backend, window);
 		damage_window(server, window, "focus-new");
 		inis_backend_update_window_style(&server->backend, window);
 	} else {
-		inis_backend_focus_window(&server->backend, NULL);
+		/*
+		 * Do not push a focus(NULL) round-trip through swc here.  During
+		 * synchronous client shutdown the current keyboard focus may still
+		 * belong to a window that is in the middle of being destroyed.
+		 * Keeping the logical focus cleared and letting the next arrange or
+		 * explicit focus change pick a new target is safer than forcing an
+		 * immediate backend unfocus from inside the destroy path.
+		 */
 	}
 
 	raise_visible_non_tiled_windows(server);
 	return 0;
+}
+
+int
+inis_server_focus_window(struct inis_server *server, struct inis_window *window)
+{
+	return focus_window(server, window, false);
+}
+
+int
+inis_server_focus_window_with_warp(struct inis_server *server,
+    struct inis_window *window)
+{
+	return focus_window(server, window, true);
 }
 
 int
@@ -973,7 +1175,7 @@ inis_server_focus_next(struct inis_server *server, int direction)
 			    workspace->layout.focused_view->user_data;
 
 			if (window != NULL)
-				return inis_server_focus_window(server, window);
+				return inis_server_focus_window_with_warp(server, window);
 		}
 	}
 
@@ -1030,26 +1232,91 @@ inis_server_focus_next(struct inis_server *server, int direction)
 
 	if (candidate == NULL)
 		return -1;
-	return inis_server_focus_window(server, candidate);
+	return inis_server_focus_window_with_warp(server, candidate);
 }
 
 int
 inis_server_focus_direction(struct inis_server *server, enum wc_direction direction)
 {
-	struct inis_workspace *workspace;
-	struct inis_window *window;
+	struct inis_window *focused;
+	struct inis_window *best = NULL;
+	struct inis_rect focused_rect;
+	int focused_cx;
+	int focused_cy;
+	int best_score = 0;
+	size_t i;
 
-	workspace = active_workspace_struct(server);
-	if (workspace == NULL)
+	focused = server->focused_window;
+	if (focused == NULL || !focused->mapped)
 		return -1;
-	if (layout_focus_direction(&workspace->layout, direction) != 0)
+
+	focused_rect = window_current_rect(server, focused);
+	if (focused_rect.w <= 0 || focused_rect.h <= 0)
 		return -1;
-	if (workspace->layout.focused_view == NULL)
+	focused_cx = rect_center_x(&focused_rect);
+	focused_cy = rect_center_y(&focused_rect);
+
+	for (i = 0; i < server->window_count; i++) {
+		struct inis_window *candidate = &server->windows[i];
+		struct inis_rect candidate_rect;
+		int candidate_cx;
+		int candidate_cy;
+		int primary;
+		int secondary;
+		int score;
+		bool valid = false;
+		bool overlap;
+
+		if (candidate == focused || !window_is_focusable(server, candidate))
+			continue;
+
+		candidate_rect = window_current_rect(server, candidate);
+		if (candidate_rect.w <= 0 || candidate_rect.h <= 0)
+			continue;
+		candidate_cx = rect_center_x(&candidate_rect);
+		candidate_cy = rect_center_y(&candidate_rect);
+
+		switch (direction) {
+		case WC_DIRECTION_LEFT:
+			valid = candidate_cx < focused_cx;
+			primary = focused_cx - candidate_cx;
+			secondary = abs_int(candidate_cy - focused_cy);
+			break;
+		case WC_DIRECTION_RIGHT:
+			valid = candidate_cx > focused_cx;
+			primary = candidate_cx - focused_cx;
+			secondary = abs_int(candidate_cy - focused_cy);
+			break;
+		case WC_DIRECTION_UP:
+			valid = candidate_cy < focused_cy;
+			primary = focused_cy - candidate_cy;
+			secondary = abs_int(candidate_cx - focused_cx);
+			break;
+		case WC_DIRECTION_DOWN:
+			valid = candidate_cy > focused_cy;
+			primary = candidate_cy - focused_cy;
+			secondary = abs_int(candidate_cx - focused_cx);
+			break;
+		default:
+			return -1;
+		}
+		if (!valid)
+			continue;
+
+		overlap = rects_overlap_on_secondary_axis(&focused_rect,
+		    &candidate_rect, direction);
+		score = primary * 1000 + secondary;
+		if (!overlap)
+			score += 100000000;
+		if (best == NULL || score < best_score) {
+			best = candidate;
+			best_score = score;
+		}
+	}
+
+	if (best == NULL)
 		return -1;
-	window = workspace->layout.focused_view->user_data;
-	if (window == NULL)
-		return -1;
-	return inis_server_focus_window(server, window);
+	return inis_server_focus_window_with_warp(server, best);
 }
 
 int
@@ -1078,6 +1345,7 @@ inis_server_switch_workspace(struct inis_server *server, const char *name)
 
 	damage_all_monitors(server, "workspace-switch");
 	inis_server_focus_window(server, NULL);
+	inis_backend_focus_window(&server->backend, NULL);
 	for (i = server->window_count; i > 0; i--) {
 		if (server->windows[i - 1].mapped &&
 		    server->windows[i - 1].workspace_index == (unsigned int)index) {
@@ -1221,6 +1489,8 @@ inis_server_toggle_special_workspace(struct inis_server *server, const char *nam
 	if (!workspace->visible && server->focused_window != NULL &&
 	    server->focused_window->workspace_index == (unsigned int)index)
 		inis_server_focus_window(server, NULL);
+	if (!workspace->visible)
+		inis_backend_focus_window(&server->backend, NULL);
 
 	if (workspace->visible) {
 		for (i = server->window_count; i > 0; i--) {
@@ -1421,8 +1691,73 @@ inis_server_request_fullscreen(struct inis_server *server,
 void
 inis_server_reload_config(struct inis_server *server)
 {
+	size_t i;
+
 	inis_backend_reload_bindings(&server->backend);
+
+	/* Re-apply the configured default reserved insets to every monitor. */
+	for (i = 0; i < server->monitor_count; i++) {
+		server->monitors[i].reserved.top = server->config.reserved_top;
+		server->monitors[i].reserved.bottom = server->config.reserved_bottom;
+		server->monitors[i].reserved.left = server->config.reserved_left;
+		server->monitors[i].reserved.right = server->config.reserved_right;
+		monitor_recompute_usable(&server->monitors[i]);
+	}
+
 	inis_server_arrange(server);
 	inis_server_flush_damage(server, "reload");
 	inis_info("config reload complete");
+}
+
+void
+inis_server_monitor_layout_changed(struct inis_server *server,
+    struct inis_monitor *monitor)
+{
+	if (monitor == NULL)
+		return;
+	monitor_recompute_usable(monitor);
+	/*
+	 * Coalesce into the deferred-arrange idle.  This is reached from swc
+	 * geometry callbacks, so running arrange synchronously here would risk
+	 * re-entering swc mid-update; the idle batches rapid changes into one
+	 * arrange.
+	 */
+	inis_backend_schedule_arrange(&server->backend);
+}
+
+int
+inis_server_set_monitor_reserved(struct inis_server *server, const char *name,
+    int top, int bottom, int left, int right)
+{
+	size_t i;
+	int matched = 0;
+
+	if (top < 0)
+		top = 0;
+	if (bottom < 0)
+		bottom = 0;
+	if (left < 0)
+		left = 0;
+	if (right < 0)
+		right = 0;
+
+	for (i = 0; i < server->monitor_count; i++) {
+		struct inis_monitor *monitor = &server->monitors[i];
+
+		if (name != NULL && name[0] != '\0' &&
+		    strcmp(name, monitor->name) != 0)
+			continue;
+		monitor->reserved.top = top;
+		monitor->reserved.bottom = bottom;
+		monitor->reserved.left = left;
+		monitor->reserved.right = right;
+		monitor_recompute_usable(monitor);
+		matched++;
+	}
+
+	if (matched > 0) {
+		inis_server_arrange(server);
+		inis_server_flush_damage(server, "monitor-reserved");
+	}
+	return matched;
 }

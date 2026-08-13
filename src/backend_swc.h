@@ -13,6 +13,7 @@ void inis_backend_swc_close_window(struct inis_backend *backend,
     struct inis_window *window);
 void inis_backend_swc_focus_window(struct inis_backend *backend,
     struct inis_window *window);
+void inis_backend_swc_warp_pointer(struct inis_backend *backend, int x, int y);
 void inis_backend_swc_update_window_style(struct inis_backend *backend,
     struct inis_window *window);
 void inis_backend_swc_apply_window(struct inis_backend *backend,

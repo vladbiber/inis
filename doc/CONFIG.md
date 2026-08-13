@@ -143,6 +143,52 @@ windowrule noborder title:Picture-in-Picture
 
 `monitor NAME` is parsed but not applied yet.
 
+## Reserved Space for External Bars
+
+`inis` keeps bars out of core, so it does not draw a bar itself. Until full
+layer-shell support lands (ROADMAP Phase 7), you can reserve screen edges for an
+external bar (Waybar, yambar, sfwbar, …) so tiled and floating windows never
+cover it.
+
+Reserve space in the config with four pixel values, in `TOP BOTTOM LEFT RIGHT`
+order, applied to every output:
+
+```conf
+# Reserve a 34px strip at the top for a bar.
+reserved 34 0 0 0
+exec-once waybar
+```
+
+The reservation is subtracted from the area the backend already reports as
+usable, so it composes with anything the backend itself reserves.
+
+### Runtime control
+
+A bar that knows its own size can claim or release space at runtime through
+`inisctl`, for all outputs or a single named one:
+
+```sh
+# All monitors: reserve 34px at the top.
+inisctl dispatch reserved 34 0 0 0
+
+# Only output swc-0: reserve a 40px bottom bar.
+inisctl dispatch reserved swc-0 0 40 0 0
+
+# Release the reservation again.
+inisctl dispatch reserved 0 0 0 0
+```
+
+`inisctl monitors` reports each output's geometry, effective `usable` area, and
+current `reserved` insets (as `top,bottom,left,right`), so a bar can read back
+what the compositor applied. `inisctl reload` re-applies the configured
+`reserved` defaults to every output.
+
+If the requested insets would leave no usable area, they are ignored and the
+backend usable area is kept, with a warning in the log.
+
+`inis` also now tracks the backend's `usable_geometry_changed` notification, so
+if the backend reserves space for a surface, the layout responds automatically.
+
 ## Current Binding Support
 
 The swc adapter can register the current binding table through `swc_add_binding`.

@@ -31,7 +31,7 @@ struct inis_backend {
 	struct wl_event_source *sigterm_source;
 	struct wl_event_source *ipc_source;
 	struct wl_event_source *arrange_idle;
-	struct wl_event_source *arrange_retry_timer;
+	bool arrange_scheduled;
 	struct wl_event_source *grab_timer;
 	struct wl_event_source *focus_retry_timer;
 	const char *wayland_socket;
@@ -43,6 +43,9 @@ struct inis_backend {
 	int32_t grab_start_cx_fixed;
 	int32_t grab_start_cy_fixed;
 	struct inis_rect grab_initial_rect;
+	uint64_t pending_focus_due_ms;
+	uint64_t pending_focus_deadline_ms;
+	bool pending_focus_warp;
 };
 
 void inis_backend_init(struct inis_backend *backend, struct inis_server *server);
@@ -54,6 +57,7 @@ void inis_backend_close_window(struct inis_backend *backend,
     struct inis_window *window);
 void inis_backend_focus_window(struct inis_backend *backend,
     struct inis_window *window);
+void inis_backend_warp_pointer(struct inis_backend *backend, int x, int y);
 void inis_backend_update_window_style(struct inis_backend *backend,
     struct inis_window *window);
 void inis_backend_apply_window(struct inis_backend *backend,

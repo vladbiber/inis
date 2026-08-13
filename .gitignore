@@ -1,9 +1,14 @@
 /inis
 /inisctl
+/inis-asan
+/test_layout
 *.o
 *.so
 *.a
+*.bak*
 build/
 dist/
 .cache/
+.deps/
+.claude-flow/
 compile_commands.json

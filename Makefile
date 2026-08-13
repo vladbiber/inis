@@ -3,7 +3,8 @@ PREFIX  ?= /usr/local
 PKGCONF ?= pkg-config
 
 # Auto-detect neuswc prefix so 'make' works without setting PKG_CONFIG_PATH
-_NEU_PREFIX ?= $(HOME)/.local/inis-neu-prefix
+_SUDO_HOME   := $(shell if [ -n "$$SUDO_USER" ]; then getent passwd "$$SUDO_USER" | cut -d: -f6; else printf '%s' "$$HOME"; fi)
+_NEU_PREFIX  ?= $(_SUDO_HOME)/.local/inis-neu-prefix
 _NEU_PC      = $(_NEU_PREFIX)/lib64/pkgconfig
 ifneq ($(wildcard $(_NEU_PC)/swc.pc),)
 PKG_CONFIG_PATH := $(_NEU_PC)$(if $(PKG_CONFIG_PATH),:$(PKG_CONFIG_PATH))

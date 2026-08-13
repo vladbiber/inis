@@ -86,8 +86,14 @@ exclusive zones, keyboard interactivity, output assignment, and damage.
 
 Tests: Waybar exclusive zone, clock update does not repaint all clients.
 
-Status: postponed. neuswc contains layer-shell code, but `inis` does not yet own
-or expose layer surface policy.
+Status: partial. The full layer-shell protocol (layer surfaces, anchors,
+keyboard interactivity) is still postponed — the installed neuswc `swc.h` does
+not expose a layer-surface API for `inis` to drive. As an interim step, `inis`
+now owns reserved-space policy: configurable per-edge exclusive zones for
+external bars (`reserved TOP BOTTOM LEFT RIGHT` in config and
+`inisctl dispatch reserved [MONITOR] ...` at runtime), and it tracks the
+backend's `usable_geometry_changed` notification so the layout reacts when the
+backend reserves space.
 
 ## Phase 8: XWayland
 

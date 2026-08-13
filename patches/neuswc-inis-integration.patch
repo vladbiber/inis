@@ -1,0 +1,672 @@
+diff --git a/libswc/compositor.c b/libswc/compositor.c
+index cb8ce7f..14f6c15 100644
+--- a/libswc/compositor.c
++++ b/libswc/compositor.c
+@@ -43,6 +43,7 @@
+ #include "subsurface.h"
+ #include "surface.h"
+ #include "swc.h"
++#include "window.h"
+ #include "util.h"
+ #include "view.h"
+ #include "window.h"
+@@ -252,7 +253,9 @@ repaint_view(struct target *target, struct compositor_view *view,
+ 	uint32_t buf_w, buf_h;
+ 	int64_t total_border;
+ 
+-	if (!view->base.buffer) {
++	/* Check both slots: the blit below reads view->buffer (the possibly
++	 * proxied one), the sizes come from view->base.buffer. */
++	if (!view->base.buffer || !view->buffer) {
+ 		return;
+ 	}
+ 
+@@ -400,7 +403,11 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
+ 	      target->view->geometry.x, target->view->geometry.y,
+ 	      target->view->geometry.width, target->view->geometry.height);
+ 
+-	wld_set_target_surface(swc.drm->renderer, target->surface);
++	if (!wld_set_target_surface(swc.drm->renderer, target->surface)) {
++		/* Rendering with no target would hand NULL destinations to every
++		 * fill/composite below. */
++		return;
++	}
+ 
+ 	if (pixman_region32_not_empty(base_damage)) {
+ 		pixman_region32_translate(base_damage, -target->view->geometry.x,
+@@ -996,8 +1003,9 @@ move(struct view *base, int32_t x, int32_t y)
+ 
+ 		if (view->visible) {
+ 			/* Assume worst-case no clipping until we draw the next frame (in
+-			 * case the surface gets moved again before that). */
+-			pixman_region32_init(&view->clip);
++			 * case the surface gets moved again before that).  clear, not
++			 * init: the region is already initialized and re-init leaks. */
++			pixman_region32_clear(&view->clip);
+ 
+ 			view_update_screens(&view->base);
+ 			damage_below_view(view);
+@@ -1355,9 +1363,31 @@ compositor_create_view(struct surface *surface)
+ void
+ compositor_view_destroy(struct compositor_view *view)
+ {
++	struct compositor_view *other;
++
+ 	wl_signal_emit(&view->destroy_signal, NULL);
+ 	compositor_view_hide(view);
+ 	surface_set_view(view->surface, NULL);
++
++	/* Detach any children still pointing at this view.  When a client with
++	 * several windows dies (e.g. OBS), its resources are destroyed in
++	 * arbitrary order, so a parent can be freed before its children; a
++	 * stale view->parent is later walked by window_view() and a stale
++	 * swc_window.parent is walked by the WM — both use-after-free. */
++	wl_list_for_each(other, &compositor.views, link)
++	{
++		if (other == view) {
++			continue;
++		}
++		if (other->parent == view) {
++			other->parent = NULL;
++		}
++		if (other->window && view->window
++		    && other->window->base.parent == &view->window->base) {
++			other->window->base.parent = NULL;
++		}
++	}
++
+ 	view_finalize(&view->base);
+ 	decor_view_finalize(view);
+ 	pixman_region32_fini(&view->clip);
+@@ -1377,6 +1407,11 @@ compositor_view_set_parent(struct compositor_view *view,
+ {
+ 	view->parent = parent;
+ 
++	/* A NULL parent just detaches the view; keep its current visibility. */
++	if (!parent) {
++		return;
++	}
++
+ 	if (parent->visible) {
+ 		compositor_view_show(view);
+ 	} else {
+@@ -1412,7 +1447,7 @@ compositor_view_restack(struct compositor_view *view,
+ void
+ compositor_view_show(struct compositor_view *view)
+ {
+-	struct compositor_view *other;
++	struct compositor_view *other, *tmp;
+ 	struct subsurface *subsurface;
+ 
+ 	if (view->visible) {
+@@ -1439,7 +1474,9 @@ compositor_view_show(struct compositor_view *view)
+ 	damage_view(view);
+ 	update(&view->base);
+ 
+-	wl_list_for_each(other, &compositor.views, link)
++	/* _safe: showing a child calls raise_window, which relinks nodes in
++	 * compositor.views under this iteration. */
++	wl_list_for_each_safe(other, tmp, &compositor.views, link)
+ 	{
+ 		if (other->parent == view) {
+ 			compositor_view_show(other);
+@@ -1450,7 +1487,7 @@ compositor_view_show(struct compositor_view *view)
+ void
+ compositor_view_hide(struct compositor_view *view)
+ {
+-	struct compositor_view *other;
++	struct compositor_view *other, *tmp;
+ 
+ 	if (!view->visible) {
+ 		return;
+@@ -1463,7 +1500,7 @@ compositor_view_hide(struct compositor_view *view)
+ 	view_set_screens(&view->base, 0);
+ 	view->visible = false;
+ 
+-	wl_list_for_each(other, &compositor.views, link)
++	wl_list_for_each_safe(other, tmp, &compositor.views, link)
+ 	{
+ 		if (other->parent == view) {
+ 			compositor_view_hide(other);
+diff --git a/libswc/dmabuf.c b/libswc/dmabuf.c
+index b7e0853..8e0909b 100644
+--- a/libswc/dmabuf.c
++++ b/libswc/dmabuf.c
+@@ -127,7 +127,14 @@ create_immed(struct wl_client *client, struct wl_resource *resource,
+ 		params->fd[i] = -1;
+ 	}
+ 	if (!buffer) {
++		/*
++		 * Import failed (e.g. a tiled/modifier GPU buffer wld cannot
++		 * handle). Tell the client and stop: creating a wl_buffer with a
++		 * NULL backing here would crash later when the client attaches it
++		 * or on teardown (wld_buffer_unreference(NULL)).
++		 */
+ 		zwp_linux_buffer_params_v1_send_failed(resource);
++		return;
+ 	}
+ 
+ 	buffer_resource = wayland_buffer_create_resource(client, 1, id, buffer);
+diff --git a/libswc/drm.c b/libswc/drm.c
+index cd6eb82..9937006 100644
+--- a/libswc/drm.c
++++ b/libswc/drm.c
+@@ -312,7 +312,16 @@ drm_initialize(void)
+ 		goto error3;
+ 	}
+ 
+-	if (!wld_drm_is_dumb(swc.drm->context)) {
++	/*
++	 * The wld renderer imports client buffers as linear and cannot negotiate
++	 * DRM format modifiers. GPU/EGL clients therefore hand us tiled buffers
++	 * that composite as garbage or solid black (e.g. a QtWayland shell like
++	 * noctalia turns the whole screen black) and tear down unsafely. Unless
++	 * explicitly opted in via SWC_ENABLE_GPU_BUFFERS, do not advertise wl_drm
++	 * or linux-dmabuf, so EGL clients fall back to wl_shm (software upload),
++	 * which we composite correctly.
++	 */
++	if (!wld_drm_is_dumb(swc.drm->context) && getenv("SWC_ENABLE_GPU_BUFFERS")) {
+ 		drm.global = wl_global_create(swc.display, &wl_drm_interface, 2, NULL,
+ 		                              &bind_drm);
+ 		if (!drm.global) {
+diff --git a/libswc/keyboard.c b/libswc/keyboard.c
+index 2a0b284..89b7acb 100644
+--- a/libswc/keyboard.c
++++ b/libswc/keyboard.c
+@@ -76,6 +76,11 @@ leave(struct input_focus_handler *handler,
+ 	struct wl_resource *resource;
+ 	uint32_t serial;
+ 
++	/* view can be NULL when focus was already torn down (e.g. the focused
++	 * view's client died); there is no surface left to name in the event. */
++	if (!view || !view->surface) {
++		return;
++	}
+ 	serial = wl_display_next_serial(swc.display);
+ 	wl_resource_for_each(resource, resources)
+ 	    wl_keyboard_send_leave(resource, serial, view->surface->resource);
+diff --git a/libswc/layer_shell.c b/libswc/layer_shell.c
+index caa34fc..af9b1f2 100644
+--- a/libswc/layer_shell.c
++++ b/libswc/layer_shell.c
+@@ -19,6 +19,7 @@ struct layer_surface {
+ 	struct wl_resource *resource;
+ 	struct wl_listener surface_destroy_listener;
+ 	struct wl_listener surface_commit_listener;
++	struct wl_listener screen_destroy_listener;
+ 	struct compositor_view *view;
+ 	struct view_handler view_handler;
+ 	struct screen *screen;
+@@ -115,29 +116,20 @@ exclusive_edge(struct layer_surface *surface)
+ static int32_t
+ exclusive_size(struct layer_surface *surface)
+ {
+-	switch (surface->current.exclusive_zone) {
+-	case 0:
+-		return 0;
+-	case -1:
+-		switch (exclusive_edge(surface)) {
+-		case ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP:
+-			return (int32_t)surface->view->base.geometry.height +
+-			       surface->current.margin.top;
+-		case ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM:
+-			return (int32_t)surface->view->base.geometry.height +
+-			       surface->current.margin.bottom;
+-		case ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT:
+-			return (int32_t)surface->view->base.geometry.width +
+-			       surface->current.margin.left;
+-		case ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT:
+-			return (int32_t)surface->view->base.geometry.width +
+-			       surface->current.margin.right;
+-		default:
+-			return 0;
+-		}
+-	default:
+-			return MAX(surface->current.exclusive_zone, 0);
+-	}
++	/*
++	 * Only a positive exclusive zone reserves space in the usable area.
++	 * Per the wlr-layer-shell protocol, a zone of 0 means "move me out of
++	 * the way of others but reserve nothing", and -1 means "ignore other
++	 * surfaces' exclusive zones and stretch to my anchored edges, reserving
++	 * nothing".  Both must contribute 0 here.
++	 *
++	 * The previous code treated -1 as "reserve my entire width/height",
++	 * which collapsed the screen's usable area whenever a client mapped a
++	 * full-screen overlay/background/wallpaper layer with exclusive_zone -1
++	 * (e.g. a Quickshell shell like noctalia): tiled windows then shrank to
++	 * a sliver or vanished.
++	 */
++	return MAX(surface->current.exclusive_zone, 0);
+ }
+ 
+ static void
+@@ -182,10 +174,15 @@ restack_layer(struct layer_surface *surface)
+ static void
+ update_position(struct layer_surface *surface)
+ {
+-	struct swc_rectangle *screen = &surface->screen->base.geometry;
++	struct swc_rectangle *screen;
+ 	struct swc_rectangle *view = &surface->view->base.geometry;
+ 	int32_t x, y;
+ 
++	if (!surface->screen) {
++		return;
++	}
++	screen = &surface->screen->base.geometry;
++
+ 	if ((surface->current.anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT) &&
+ 	    !(surface->current.anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) {
+ 		x = screen->x + surface->current.margin.left;
+@@ -484,6 +481,9 @@ destroy_layer_surface(struct wl_resource *resource)
+ 	wl_list_remove(&surface->surface_destroy_listener.link);
+ 	wl_list_remove(&surface->surface_commit_listener.link);
+ 	wl_list_remove(&surface->modifier.link);
++	if (had_screen) {
++		wl_list_remove(&surface->screen_destroy_listener.link);
++	}
+ 	compositor_view_destroy(surface->view);
+ 	if (had_screen) {
+ 		screen_update_usable_geometry(surface->screen);
+@@ -491,6 +491,25 @@ destroy_layer_surface(struct wl_resource *resource)
+ 	free(surface);
+ }
+ 
++/* The screen died before this layer surface (compositor shutdown with the
++ * shell still connected, or output unplug).  Detach everything that points
++ * into the freed screen: the modifier link lives inside screen->modifiers and
++ * surface->screen itself.  Without this, destroy_layer_surface later writes
++ * into freed screen memory and calls through a freed handler pointer. */
++static void
++handle_screen_destroy(struct wl_listener *listener, void *data)
++{
++	struct layer_surface *surface =
++	    wl_container_of(listener, surface, screen_destroy_listener);
++
++	(void)data;
++
++	wl_list_remove(&surface->modifier.link);
++	wl_list_init(&surface->modifier.link);
++	wl_list_remove(&surface->screen_destroy_listener.link);
++	surface->screen = NULL;
++}
++
+ static void
+ handle_surface_destroy(struct wl_listener *listener, void *data)
+ {
+@@ -537,6 +556,8 @@ layer_surface_new(struct wl_client *client, uint32_t version, uint32_t id,
+ 	layer_surface->pending = layer_surface->current;
+ 	layer_surface->surface_destroy_listener.notify = handle_surface_destroy;
+ 	layer_surface->surface_commit_listener.notify = handle_surface_commit;
++	layer_surface->screen_destroy_listener.notify = handle_screen_destroy;
++	wl_signal_add(&screen->destroy_signal, &layer_surface->screen_destroy_listener);
+ 	layer_surface->view_handler.impl = &view_handler_impl;
+ 	layer_surface->modifier.modify = modify;
+ 	wl_list_init(&layer_surface->modifier.link);
+diff --git a/libswc/panel.c b/libswc/panel.c
+index 5434d38..ae0d964 100644
+--- a/libswc/panel.c
++++ b/libswc/panel.c
+@@ -230,6 +230,7 @@ destroy_panel(struct wl_resource *resource)
+ 		screen_update_usable_geometry(panel->screen);
+ 	}
+ 
++	wl_list_remove(&panel->surface_destroy_listener.link);
+ 	compositor_view_destroy(panel->view);
+ 	free(panel);
+ }
+diff --git a/libswc/shm.c b/libswc/shm.c
+index 84bba3b..c5e8d13 100644
+--- a/libswc/shm.c
++++ b/libswc/shm.c
+@@ -40,6 +40,16 @@
+ #include <wld/pixman.h>
+ #include <wld/wld.h>
+ 
++/* A mapping retired by a pool resize that had to relocate.  It must stay
++ * mapped until the pool dies: wld buffers created before the resize baked in
++ * raw pointers into it, and MAP_SHARED means it keeps showing the current
++ * pool contents, so those buffers remain fully valid. */
++struct old_mapping {
++	void *data;
++	size_t size;
++	struct old_mapping *next;
++};
++
+ struct pool {
+ 	struct wl_resource *resource;
+ 	struct swc_shm *shm;
+@@ -48,6 +58,7 @@ struct pool {
+ 	int fd;
+ 	bool writable;
+ 	unsigned references;
++	struct old_mapping *old_mappings;
+ };
+ 
+ struct pool_reference {
+@@ -93,30 +104,55 @@ handle_shm_buffer_resource_destroy(struct wl_listener *listener, void *data)
+ static void *
+ swc_mremap(struct pool *pool, void *oldp, size_t oldsize, size_t newsize)
+ {
+-#ifdef __NetBSD__
+-	return mremap(oldp, oldsize, NULL, newsize, 0);
+-#elif defined(__linux__)
+-	return mremap(oldp, oldsize, newsize, MREMAP_MAYMOVE);
+-#else
+ 	void *newp;
++	struct old_mapping *old;
++
++#ifdef __linux__
++	/* Grow in place when possible: every wld buffer created from this pool
++	 * baked in a raw pointer into the mapping at create_buffer time, so
++	 * the mapping must not move.  MREMAP_MAYMOVE unmapped the old range
++	 * and left those buffers pointing at unmapped memory — the next
++	 * repaint blitting from such a buffer crashed the compositor (Qt
++	 * clients like OBS resize their shm pools on every window resize). */
++	newp = mremap(oldp, oldsize, newsize, 0);
++	if (newp != MAP_FAILED) {
++		return newp;
++	}
++#endif
+ 
+ 	newp = mmap(NULL, newsize, PROT_READ, MAP_SHARED, pool->fd, 0);
+ 	if (newp == MAP_FAILED) {
+ 		return MAP_FAILED;
+ 	}
+ 
+-	(void)munmap(oldp, oldsize);
++	/* Could not grow in place: keep the old mapping alive instead of
++	 * unmapping it.  MAP_SHARED mappings of the same fd share pages, so
++	 * pre-resize buffers keep rendering current content through the old
++	 * addresses.  Retired mappings are released when the pool dies. */
++	old = malloc(sizeof(*old));
++	if (old) {
++		old->data = oldp;
++		old->size = oldsize;
++		old->next = pool->old_mappings;
++		pool->old_mappings = old;
++	}
+ 	return newp;
+-#endif
+ }
+ 
+ static void
+ unref_pool(struct pool *pool)
+ {
++	struct old_mapping *old, *next;
++
+ 	if (--pool->references > 0) {
+ 		return;
+ 	}
+ 
++	for (old = pool->old_mappings; old != NULL; old = next) {
++		next = old->next;
++		munmap(old->data, old->size);
++		free(old);
++	}
+ 	munmap(pool->data, pool->size);
+ 	close(pool->fd);
+ 	free(pool);
+@@ -135,6 +171,7 @@ handle_buffer_destroy(struct wld_destructor *destructor)
+ 	struct pool_reference *reference =
+ 	    wl_container_of(destructor, reference, destructor);
+ 	unref_pool(reference->pool);
++	free(reference);
+ }
+ 
+ static inline uint32_t
+@@ -281,6 +318,7 @@ create_pool(struct wl_client *client, struct wl_resource *resource, uint32_t id,
+ 		goto error0;
+ 	}
+ 	pool->shm = shm;
++	pool->old_mappings = NULL;
+ 	pool->resource = wl_resource_create(client, &wl_shm_pool_interface,
+ 	                                    wl_resource_get_version(resource), id);
+ 	if (!pool->resource) {
+diff --git a/libswc/subcompositor.c b/libswc/subcompositor.c
+index b99ef2a..8cf52c3 100644
+--- a/libswc/subcompositor.c
++++ b/libswc/subcompositor.c
+@@ -68,6 +68,15 @@ get_subsurface(struct wl_client *client, struct wl_resource *resource,
+ 		return;
+ 	}
+ 
++	/* A surface that already holds another role (xdg, layer-shell, panel)
++	 * must not also become a subsurface: its compositor_view would gain a
++	 * second owner and be destroyed twice. */
++	if (surface->role) {
++		wl_resource_post_error(resource, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
++		                       "surface already has a role");
++		return;
++	}
++
+ 	subsurface = subsurface_new(client, wl_resource_get_version(resource), id,
+ 	                            surface, parent);
+ 
+diff --git a/libswc/surface.c b/libswc/surface.c
+index 54479be..6efd8fe 100644
+--- a/libswc/surface.c
++++ b/libswc/surface.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "surface.h"
++#include "compositor.h"
+ #include "event.h"
+ #include "internal.h"
+ #include "output.h"
+@@ -397,7 +398,19 @@ surface_destroy(struct wl_resource *resource)
+ 	state_finalize(&surface->pending.state);
+ 
+ 	if (surface->view) {
+-		wl_list_remove(&surface->view_handler.link);
++		struct compositor_view *cv = compositor_view(surface->view);
++
++		/* Any view still attached at destructor time is ownerless (role
++		 * owners tear theirs down from destroy listeners, which have all
++		 * run by now) — e.g. the parent view subsurface_new creates for a
++		 * role-less parent.  Left alone it would sit in compositor.views
++		 * forever with a dangling view->surface.  Destroying it also
++		 * unlinks surface->view_handler via surface_set_view. */
++		if (cv) {
++			compositor_view_destroy(cv);
++		} else {
++			wl_list_remove(&surface->view_handler.link);
++		}
+ 	}
+ 	if (surface->role) {
+ 		wl_list_remove(&surface->role_destroy_listener.link);
+diff --git a/libswc/swc.c b/libswc/swc.c
+index 4ae726f..4aadc85 100644
+--- a/libswc/swc.c
++++ b/libswc/swc.c
+@@ -144,6 +144,24 @@ swc_cursor_position(int32_t *x, int32_t *y)
+ 	return true;
+ }
+ 
++EXPORT bool
++swc_cursor_warp(int32_t x, int32_t y)
++{
++	if (!swc.seat || !swc.seat->pointer) {
++		return false;
++	}
++
++	pointer_handle_absolute_motion(swc.seat->pointer, 0, x, y);
++	pointer_handle_frame(swc.seat->pointer);
++	return true;
++}
++
++EXPORT bool
++swc_keyboard_has_focus(void)
++{
++	return swc.seat && swc.seat->keyboard && swc.seat->keyboard->focus.view;
++}
++
+ EXPORT bool
+ swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
+                const struct swc_manager *manager)
+diff --git a/libswc/swc.h b/libswc/swc.h
+index 80b49f0..f04ae30 100644
+--- a/libswc/swc.h
++++ b/libswc/swc.h
+@@ -48,6 +48,25 @@ struct wld_buffer;
+ bool
+ swc_cursor_position(int32_t *x, int32_t *y);
+ 
++/**
++ * Move the cursor to a compositor-global position.
++ *
++ * Coordinates use the same raw wl_fixed_t (24.8) representation as
++ * swc_cursor_position().
++ */
++bool
++swc_cursor_warp(int32_t x, int32_t y);
++
++/**
++ * Whether any surface currently holds keyboard focus.
++ *
++ * Lets the WM detect a dropped focus (e.g. a keyboard-interactive
++ * layer-shell surface died) and restore it, without stealing focus
++ * while such a surface legitimately holds it.
++ */
++bool
++swc_keyboard_has_focus(void);
++
+ /**
+  * Send a pointer button event to the currently focused client.
+  *
+diff --git a/libswc/view.c b/libswc/view.c
+index 05c30e5..a8ad07f 100644
+--- a/libswc/view.c
++++ b/libswc/view.c
+@@ -54,6 +54,19 @@ view_initialize(struct view *view, const struct view_impl *impl)
+ void
+ view_finalize(struct view *view)
+ {
++	struct view_handler *handler, *tmp;
++
++	/* Detach any handlers still linked to this view.  The handler structs
++	 * are embedded in other objects (windows, subsurfaces) that may outlive
++	 * the view when a client's resources are destroyed in arbitrary order;
++	 * a later wl_list_remove on a link into freed view memory corrupts the
++	 * heap (seen with subsurface parent_view_handler on OBS disconnect). */
++	wl_list_for_each_safe(handler, tmp, &view->handlers, link)
++	{
++		wl_list_remove(&handler->link);
++		wl_list_init(&handler->link);
++	}
++
+ 	if (view->buffer) {
+ 		wld_buffer_unreference(view->buffer);
+ 	}
+diff --git a/libswc/window.c b/libswc/window.c
+index 19a9897..868bf18 100644
+--- a/libswc/window.c
++++ b/libswc/window.c
+@@ -563,6 +563,13 @@ window_finalize(struct window *window)
+ {
+ 	DEBUG("Finalizing window, %p\n", window);
+ 
++	/* End any interactive move/resize: begin_interaction linked
++	 * interaction->handler into the global pointer handler list and
++	 * possibly a pressed button's handler pointer; both point into this
++	 * window and would be called after free on the next pointer event. */
++	end_interaction(&window->move.interaction, NULL);
++	end_interaction(&window->resize.interaction, NULL);
++
+ 	window_unmanage(window);
+ 	compositor_view_destroy(window->view);
+ 	free(window->base.title);
+@@ -619,12 +626,17 @@ window_set_app_id(struct window *window, const char *app_id)
+ void
+ window_set_parent(struct window *window, struct window *parent)
+ {
+-	if (window->base.parent == &parent->base) {
++	/* parent may be NULL: xdg_toplevel.set_parent(nil) is how clients
++	 * (Qt in particular) clear a transient parent, e.g. when closing a
++	 * dialog.  Dereferencing it unconditionally crashed the compositor. */
++	struct swc_window *new_parent = parent ? &parent->base : NULL;
++
++	if (window->base.parent == new_parent) {
+ 		return;
+ 	}
+ 
+-	compositor_view_set_parent(window->view, parent->view);
+-	window->base.parent = &parent->base;
++	compositor_view_set_parent(window->view, parent ? parent->view : NULL);
++	window->base.parent = new_parent;
+ 
+ 	if (window->handler->parent_changed) {
+ 		window->handler->parent_changed(window->handler_data);
+diff --git a/libswc/xdg_shell.c b/libswc/xdg_shell.c
+index c5d6986..68b8411 100644
+--- a/libswc/xdg_shell.c
++++ b/libswc/xdg_shell.c
+@@ -661,14 +661,21 @@ ack_configure(struct wl_client *client, struct wl_resource *resource,
+               uint32_t serial)
+ {
+ 	struct xdg_surface *xdg_surface = wl_resource_get_user_data(resource);
+-	struct window *window;
++	struct xdg_toplevel *toplevel;
+ 
+ 	if (!xdg_surface->role) {
+ 		return;
+ 	}
+-	window = wl_resource_get_user_data(xdg_surface->role);
+-	if (window && serial == xdg_surface->configure_serial) {
+-		window->configure.acknowledged = true;
++	/* Only toplevels track configure state.  The popup role's user data is
++	 * a struct xdg_popup — casting it to struct window and writing
++	 * configure.acknowledged was an out-of-bounds write. */
++	if (!wl_resource_instance_of(xdg_surface->role, &xdg_toplevel_interface,
++	                             &toplevel_impl)) {
++		return;
++	}
++	toplevel = wl_resource_get_user_data(xdg_surface->role);
++	if (toplevel && serial == xdg_surface->configure_serial) {
++		toplevel->window.configure.acknowledged = true;
+ 	}
+ }
+ 
+@@ -754,6 +761,9 @@ xdg_surface_new(struct wl_client *client, uint32_t version, uint32_t id,
+ 	xdg_surface->surface = surface;
+ 	xdg_surface->surface_destroy_listener.notify = &handle_surface_destroy;
+ 	xdg_surface->role = NULL;
++	/* malloc'd — an uninitialized serial could make ack_configure match a
++	 * garbage value and flip configure state for a never-sent configure. */
++	xdg_surface->configure_serial = 0;
+ 	xdg_surface->role_destroy_listener.notify = &handle_role_destroy;
+ 	wl_resource_add_destroy_listener(surface->resource,
+ 	                                 &xdg_surface->surface_destroy_listener);
+diff --git a/libswc/xserver.c b/libswc/xserver.c
+index 46b841f..76fc848 100644
+--- a/libswc/xserver.c
++++ b/libswc/xserver.c
+@@ -298,15 +298,25 @@ xserver_initialize(void)
+ 			goto fail;
+ 		}
+ 
++		/*
++		 * Reset SIGCHLD to its default disposition.  A compositor commonly
++		 * sets SIGCHLD to SIG_IGN to auto-reap its own children, and that
++		 * disposition survives exec.  Xwayland forks xkbcomp to compile the
++		 * keymap and waitpid()s for it; with SIGCHLD ignored, waitpid()
++		 * fails with ECHILD, so Xwayland believes the compile failed and
++		 * aborts with "Failed to activate virtual core keyboard".
++		 */
++		signal(SIGCHLD, SIG_DFL);
++
+ 		setenv("WAYLAND_SOCKET", strings[0], true);
+ 
+ 		#ifdef __linux__
+ 		execlp("Xwayland", "Xwayland", xserver.display_name, "-rootless",
+-		       "-terminate", "-listen", strings[2], "-listen", strings[3],
++		       "-terminate", "-listenfd", strings[2], "-listenfd", strings[3],
+ 		       "-wm", strings[1], NULL);
+ 		#else
+ 		execlp("Xwayland", "Xwayland", xserver.display_name, "-rootless",
+-		       "-terminate", "-listen", strings[3],
++		       "-terminate", "-listenfd", strings[3],
+ 		       "-wm", strings[1], NULL);
+ 		#endif
+ 

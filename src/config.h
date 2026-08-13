@@ -23,6 +23,11 @@ struct inis_config {
 	int gaps_out;
 	int border_size;
 	double master_ratio;
+	/* Default reserved space for external bars, per edge, in pixels. */
+	int reserved_top;
+	int reserved_bottom;
+	int reserved_left;
+	int reserved_right;
 };
 
 void inis_config_init(struct inis_config *config);

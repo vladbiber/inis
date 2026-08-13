@@ -224,6 +224,18 @@ inis_config_apply_line(struct inis_config *config,
 		return 0;
 	}
 
+	if (strncmp(s, "reserved ", 9) == 0) {
+		int top, bottom, left, right;
+
+		if (sscanf(s + 9, "%d %d %d %d", &top, &bottom, &left, &right) != 4)
+			return -1;
+		config->reserved_top = top >= 0 ? top : 0;
+		config->reserved_bottom = bottom >= 0 ? bottom : 0;
+		config->reserved_left = left >= 0 ? left : 0;
+		config->reserved_right = right >= 0 ? right : 0;
+		return 0;
+	}
+
 	n = sscanf(s, "%63s %63s %255[^\n]", key, name, value);
 	if (n < 2)
 		return -1;

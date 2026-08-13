@@ -1,0 +1,24 @@
+diff --git a/pixman.c b/pixman.c
+index ed7788f..cb91bb9 100644
+--- a/pixman.c
++++ b/pixman.c
+@@ -326,7 +326,18 @@ renderer_copy_region(struct wld_renderer *base, struct buffer *buffer,
+ 	pixman_region32_translate(&clip, dst_x, dst_y);
+ 
+ 	pixman_image_set_clip_region32(dst, &clip);
+-	pixman_image_composite32(PIXMAN_OP_SRC, src, NULL, dst,
++	/*
++	 * Composite with OVER, not SRC: copy_region is the compositing path
++	 * (swc's repaint_view blends each surface onto the screen target).  A
++	 * plain SRC copy ignores the source alpha, so a translucent ARGB surface
++	 * overwrites the destination with its premultiplied pixels — fully
++	 * transparent areas (premultiplied 0,0,0,0) then show as solid black.
++	 * This is what made a Quickshell shell like noctalia paint a large black
++	 * rectangle from its full-screen translucent layer-shell overlays.  OVER
++	 * is also what upstream wld uses here.  Opaque buffers (XRGB, or ARGB
++	 * with alpha 0xff) are unaffected: OVER degenerates to SRC for them.
++	 */
++	pixman_image_composite32(PIXMAN_OP_OVER, src, NULL, dst,
+ 	                         region->extents.x1, region->extents.y1, 0, 0,
+ 	                         region->extents.x1 + dst_x,
+ 	                         region->extents.y1 + dst_y,

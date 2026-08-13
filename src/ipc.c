@@ -102,7 +102,13 @@ inis_ipc_accept(struct inis_server *server)
 	if (client < 0)
 		return;
 
+	/*
+	 * Both directions need the timeout: without SO_SNDTIMEO a client that
+	 * connects but never reads its reply blocks write() forever and freezes
+	 * the whole compositor (IPC is served on the event-loop thread).
+	 */
 	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	n = recv(client, buf, sizeof(buf) - 1, 0);
 	if (n <= 0) {
 		close(client);
@@ -223,12 +229,19 @@ ipc_monitors(struct inis_server *server, int fd)
 	size_t i;
 
 	for (i = 0; i < server->monitor_count; i++) {
-		snprintf(line, sizeof(line), "%s %dx%d+%d+%d workspace:%s\n",
-		    server->monitors[i].name,
-		    server->monitors[i].geometry.w, server->monitors[i].geometry.h,
-		    server->monitors[i].geometry.x, server->monitors[i].geometry.y,
-		    server->monitors[i].active_workspace < server->workspace_count ?
-		    server->workspaces[server->monitors[i].active_workspace].name : "?");
+		const struct inis_monitor *mon = &server->monitors[i];
+
+		snprintf(line, sizeof(line),
+		    "%s %dx%d+%d+%d usable:%dx%d+%d+%d reserved:%d,%d,%d,%d workspace:%s\n",
+		    mon->name,
+		    mon->geometry.w, mon->geometry.h,
+		    mon->geometry.x, mon->geometry.y,
+		    mon->usable.w, mon->usable.h,
+		    mon->usable.x, mon->usable.y,
+		    mon->reserved.top, mon->reserved.bottom,
+		    mon->reserved.left, mon->reserved.right,
+		    mon->active_workspace < server->workspace_count ?
+		    server->workspaces[mon->active_workspace].name : "?");
 		ipc_reply(fd, line);
 	}
 }

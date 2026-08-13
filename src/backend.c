@@ -13,7 +13,7 @@ inis_backend_init(struct inis_backend *backend, struct inis_server *server)
 	backend->sigterm_source = NULL;
 	backend->ipc_source = NULL;
 	backend->arrange_idle = NULL;
-	backend->arrange_retry_timer = NULL;
+	backend->arrange_scheduled = false;
 	backend->grab_timer = NULL;
 	backend->wayland_socket = NULL;
 	backend->wayland_env[0] = '\0';
@@ -24,6 +24,9 @@ inis_backend_init(struct inis_backend *backend, struct inis_server *server)
 	backend->grab_start_cx_fixed = 0;
 	backend->grab_start_cy_fixed = 0;
 	backend->grab_initial_rect = (struct inis_rect){ 0, 0, 0, 0 };
+	backend->pending_focus_due_ms = 0;
+	backend->pending_focus_deadline_ms = 0;
+	backend->pending_focus_warp = false;
 }
 
 int
@@ -67,6 +70,12 @@ inis_backend_focus_window(struct inis_backend *backend,
     struct inis_window *window)
 {
 	inis_backend_swc_focus_window(backend, window);
+}
+
+void
+inis_backend_warp_pointer(struct inis_backend *backend, int x, int y)
+{
+	inis_backend_swc_warp_pointer(backend, x, y);
 }
 
 void

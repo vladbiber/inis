@@ -1,3 +1,6 @@
+/* For clock_gettime/CLOCK_MONOTONIC under -std=c11. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "backend_swc.h"
 
 #include "bind.h"
@@ -14,9 +17,9 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
+#include <time.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 
@@ -52,6 +55,9 @@ struct swc_window_data {
 };
 
 static void swc_new_screen(struct swc_screen *screen);
+static void swc_screen_destroy(void *data);
+static void swc_screen_geometry_changed(void *data);
+static void swc_screen_usable_geometry_changed(void *data);
 static void swc_new_window(struct swc_window *window);
 static void swc_new_device(struct libinput_device *device);
 static void swc_activate(void);
@@ -61,17 +67,15 @@ static void swc_window_title_changed(void *data);
 static void swc_window_app_id_changed(void *data);
 static void swc_window_parent_changed(void *data);
 static void swc_window_entered(void *data);
-static void swc_window_fullscreen_requested(void *data,
-    struct swc_screen *screen, bool fullscreen);
 static void swc_window_move(void *data);
 static void swc_window_resize(void *data);
 static int swc_signal(int signal_number, void *data);
 static int swc_ipc(int fd, uint32_t mask, void *data);
 static int grab_timer_cb(void *data);
-static int arrange_retry_cb(void *data);
 static int focus_retry_cb(void *data);
-static void schedule_arrange_retry(struct inis_backend *backend, int delay_ms);
 static void schedule_focus_retry(struct inis_backend *backend, int delay_ms);
+static void request_pending_focus(struct inis_backend *backend,
+    struct inis_window *window, bool warp);
 static void apply_pending_focus(struct inis_backend *backend);
 static void swc_binding(void *data, uint32_t time, uint32_t value,
     uint32_t state);
@@ -93,9 +97,14 @@ static const struct swc_window_handler window_handler = {
 	.app_id_changed = swc_window_app_id_changed,
 	.parent_changed = swc_window_parent_changed,
 	.entered        = swc_window_entered,
-	.fullscreen_requested = swc_window_fullscreen_requested,
 	.move           = swc_window_move,
 	.resize         = swc_window_resize,
+};
+
+static const struct swc_screen_handler screen_handler = {
+	.destroy                = swc_screen_destroy,
+	.geometry_changed       = swc_screen_geometry_changed,
+	.usable_geometry_changed = swc_screen_usable_geometry_changed,
 };
 
 static struct inis_rect
@@ -110,6 +119,12 @@ rect_from_swc(const struct swc_rectangle *rect)
 	return out;
 }
 
+static bool
+rect_equal(const struct inis_rect *a, const struct inis_rect *b)
+{
+	return a->x == b->x && a->y == b->y && a->w == b->w && a->h == b->h;
+}
+
 static int
 clamp_int(int value, int min, int max)
 {
@@ -121,73 +136,19 @@ clamp_int(int value, int min, int max)
 }
 
 /*
- * Returns true if it is safe to call swc_window_focus() to focus a new
- * window while server->focused_window is the window being unfocused.
- *
- * swc_window_focus() internally calls the unfocus handler of the currently
- * focused window's compositor_view.  The call chain reads:
- *
- *   focused_view = swc.keyboard.seat.focused_view
- *   inner        = focused_view + 0x48   (checked for NULL by swc)
- *   state        = inner        + 0x30   (NOT checked — crash if NULL)
- *   func         = state        + 0x18   (function pointer)
- *
- * The `state` pointer is NULL until the window's client has committed its
- * first rendered frame (after the xdg_surface configure round-trip).  On a
- * loaded GPU this can take well over a second.  We replicate the same
- * pointer-chain check here so we can defer the focus call until it is safe.
- *
- * window->swc + 0x48 = compositor_view  (confirmed by swc_window_show asm)
- * compositor_view + 0x48 = inner struct  (checked in compositor_view_show)
- * inner + 0x30 = state pointer           (the unsafe dereference)
+ * Delay focus slightly so clients can finish their configure/commit path.
+ * CLOCK_MONOTONIC, not gettimeofday: the focus due/deadline stamps must not
+ * jump with NTP steps or suspend/resume — a backwards wall-clock step would
+ * leave pending_focus_due_ms in the future and stall focus indefinitely.
  */
-static bool
-swc_window_render_state_ready(const struct swc_window *swc_win)
+static uint64_t
+monotonic_ms(void)
 {
-	const char *view, *inner;
+	struct timespec ts;
 
-	if (swc_win == NULL)
-		return true;
-
-	view  = *(const char *const *)((const char *)swc_win + 0x48);
-	if (view == NULL)
-		return true;
-	inner = *(const char *const *)(view + 0x48);
-	if (inner == NULL)
-		return true;
-	return *(const void *const *)(inner + 0x30) != NULL;
-}
-
-static bool
-swc_window_focus_safe(const struct inis_server *server)
-{
-	if (server->focused_window == NULL ||
-	    server->focused_window->swc == NULL)
-		return true;
-
-	return swc_window_render_state_ready(server->focused_window->swc);
-}
-
-static bool
-window_needs_managed_configure(const struct inis_window *window)
-{
-	if (window == NULL || window->swc == NULL)
-		return false;
-	if (window->state == INIS_WINDOW_FULLSCREEN)
-		return true;
-	if (window->state == INIS_WINDOW_TILED)
-		return true;
-	if (window->state == INIS_WINDOW_FLOATING && !window->transient)
-		return true;
-	return false;
-}
-
-static bool
-window_ready_for_managed_configure(const struct inis_window *window)
-{
-	if (!window_needs_managed_configure(window))
-		return true;
-	return swc_window_render_state_ready(window->swc);
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
 }
 
 static struct inis_rect
@@ -323,6 +284,8 @@ end_pointer_grab(struct inis_backend *backend)
 		backend->grab_window->interactive_grab = false;
 	backend->grab_mode = INIS_BACKEND_GRAB_NONE;
 	backend->grab_window = NULL;
+	if (backend->grab_timer != NULL)
+		wl_event_source_timer_update(backend->grab_timer, 0);
 }
 
 static int
@@ -340,49 +303,91 @@ grab_timer_cb(void *data)
 }
 
 static void
-schedule_arrange_retry(struct inis_backend *backend, int delay_ms)
-{
-	struct wl_event_loop *loop;
-
-	if (backend == NULL || backend->display == NULL)
-		return;
-
-	if (backend->arrange_retry_timer == NULL) {
-		loop = wl_display_get_event_loop(backend->display);
-		backend->arrange_retry_timer = wl_event_loop_add_timer(loop,
-		    arrange_retry_cb, backend);
-	}
-	if (backend->arrange_retry_timer != NULL)
-		wl_event_source_timer_update(backend->arrange_retry_timer,
-		    delay_ms);
-}
-
-static int
-arrange_retry_cb(void *data)
-{
-	struct inis_backend *backend = data;
-
-	if (backend == NULL)
-		return 0;
-	inis_backend_swc_schedule_arrange(backend);
-	return 0;
-}
-
-static void
 schedule_focus_retry(struct inis_backend *backend, int delay_ms)
 {
-	struct wl_event_loop *loop;
-
 	if (backend == NULL || backend->display == NULL)
 		return;
 
 	if (backend->focus_retry_timer == NULL) {
-		loop = wl_display_get_event_loop(backend->display);
+		struct wl_event_loop *loop = wl_display_get_event_loop(backend->display);
 		backend->focus_retry_timer = wl_event_loop_add_timer(loop,
 		    focus_retry_cb, backend);
 	}
 	if (backend->focus_retry_timer != NULL)
 		wl_event_source_timer_update(backend->focus_retry_timer, delay_ms);
+}
+
+/*
+ * A window is "swc-ready" once swc holds a committed view with real dimensions
+ * for it.  swc_window_focus() internally unfocuses the previously focused
+ * surface by walking its view pointer chain (view->0x48->0x30); that chain
+ * stays NULL until the surface commits its first frame.  Probing geometry is
+ * the only readiness signal swc exposes — it returns false (or a zero size)
+ * until the first commit lands, which is exactly when the chain becomes safe to
+ * dereference.  A NULL window->swc means swc has already dropped the window, so
+ * there is nothing left for it to dereference: treat that as ready.
+ */
+static bool
+window_swc_ready(struct inis_window *window)
+{
+	struct swc_rectangle geometry;
+
+	if (window == NULL || window->swc == NULL)
+		return true;
+	if (!swc_window_get_geometry(window->swc, &geometry))
+		return false;
+	return geometry.width > 0 && geometry.height > 0;
+}
+
+/*
+ * Focusing `pending` makes swc unfocus whatever currently holds focus.  That is
+ * only safe once the outgoing window is swc-ready; otherwise swc dereferences a
+ * NULL view chain and crashes the whole compositor.  Returns true when the
+ * focus may proceed now.
+ */
+static bool
+pending_focus_unfocus_safe(struct inis_server *server,
+    struct inis_window *pending)
+{
+	struct inis_window *outgoing = server->focused_window;
+
+	if (outgoing == NULL || outgoing == pending)
+		return true;
+	return window_swc_ready(outgoing);
+}
+
+static void
+request_pending_focus(struct inis_backend *backend, struct inis_window *window,
+    bool warp)
+{
+	struct inis_server *server;
+
+	if (backend == NULL || window == NULL)
+		return;
+
+	server = backend->server;
+	if (server == NULL)
+		return;
+
+	server->pending_focus_window = window;
+	/*
+	 * Short settle delay before focusing a freshly mapped window — kept only
+	 * so opening a window feels instant rather than racing the very first
+	 * frame.  Crash-safety is NOT this delay's job: the readiness probe in
+	 * apply_pending_focus / focus_retry_cb gates the actual focus on the
+	 * outgoing window having committed a frame (window_swc_ready), so a slow
+	 * client that takes longer than 120 ms can no longer trigger the
+	 * NULL-deref-on-unfocus crash inside swc.
+	 */
+	backend->pending_focus_due_ms = monotonic_ms() + 120u;
+	/*
+	 * Hard deadline for the readiness gate below.  If the outgoing window
+	 * never commits a frame (e.g. a hung client), we stop retrying and skip
+	 * the focus rather than risk a NULL-deref crash inside swc.
+	 */
+	backend->pending_focus_deadline_ms = monotonic_ms() + 2000u;
+	backend->pending_focus_warp = warp;
+	schedule_focus_retry(backend, 120);
 }
 
 static void
@@ -394,24 +399,48 @@ apply_pending_focus(struct inis_backend *backend)
 	if (server == NULL || server->pending_focus_window == NULL)
 		return;
 
-	if (!swc_window_focus_safe(server)) {
-		schedule_focus_retry(backend, 200);
+	pending = server->pending_focus_window;
+	if (backend->pending_focus_due_ms > monotonic_ms()) {
+		uint64_t remaining = backend->pending_focus_due_ms - monotonic_ms();
+		schedule_focus_retry(backend, remaining > 200 ? 200 : (int)remaining);
 		return;
 	}
 
-	pending = server->pending_focus_window;
-	server->pending_focus_window = NULL;
-
-	if (!pending->mapped || pending->swc == NULL)
+	if (!pending->mapped || pending->swc == NULL) {
+		server->pending_focus_window = NULL;
+		backend->pending_focus_due_ms = 0;
+		backend->pending_focus_warp = false;
 		return;
+	}
 
 	if (server->focused_window != NULL &&
 	    server->focused_window->state == INIS_WINDOW_FULLSCREEN &&
 	    !window_is_transient_child_of(pending, server->focused_window) &&
-	    server->focused_window->swc != NULL)
+	    server->focused_window->swc != NULL) {
+		schedule_focus_retry(backend, 200);
 		return;
+	}
 
-	(void)inis_server_focus_window(server, pending);
+	if (!pending_focus_unfocus_safe(server, pending)) {
+		if (monotonic_ms() >= backend->pending_focus_deadline_ms) {
+			inis_warn("focus skipped: outgoing window never became "
+			    "swc-ready before deadline");
+			server->pending_focus_window = NULL;
+			backend->pending_focus_due_ms = 0;
+			backend->pending_focus_warp = false;
+			return;
+		}
+		schedule_focus_retry(backend, 30);
+		return;
+	}
+
+	server->pending_focus_window = NULL;
+	backend->pending_focus_due_ms = 0;
+	if (backend->pending_focus_warp)
+		(void)inis_server_focus_window_with_warp(server, pending);
+	else
+		(void)inis_server_focus_window(server, pending);
+	backend->pending_focus_warp = false;
 }
 
 static int
@@ -424,24 +453,48 @@ focus_retry_cb(void *data)
 	if (server == NULL || server->pending_focus_window == NULL)
 		return 0;
 
-	if (!swc_window_focus_safe(server)) {
-		schedule_focus_retry(backend, 200);
+	pending = server->pending_focus_window;
+	if (backend->pending_focus_due_ms > monotonic_ms()) {
+		uint64_t remaining = backend->pending_focus_due_ms - monotonic_ms();
+		schedule_focus_retry(backend, remaining > 200 ? 200 : (int)remaining);
 		return 0;
 	}
 
-	pending = server->pending_focus_window;
-	server->pending_focus_window = NULL;
-
-	if (!pending->mapped || pending->swc == NULL)
+	if (!pending->mapped || pending->swc == NULL) {
+		server->pending_focus_window = NULL;
+		backend->pending_focus_due_ms = 0;
+		backend->pending_focus_warp = false;
 		return 0;
+	}
 
 	if (server->focused_window != NULL &&
 	    server->focused_window->state == INIS_WINDOW_FULLSCREEN &&
 	    !window_is_transient_child_of(pending, server->focused_window) &&
-	    server->focused_window->swc != NULL)
+	    server->focused_window->swc != NULL) {
+		schedule_focus_retry(backend, 200);
 		return 0;
+	}
 
-	(void)inis_server_focus_window(server, pending);
+	if (!pending_focus_unfocus_safe(server, pending)) {
+		if (monotonic_ms() >= backend->pending_focus_deadline_ms) {
+			inis_warn("focus skipped: outgoing window never became "
+			    "swc-ready before deadline");
+			server->pending_focus_window = NULL;
+			backend->pending_focus_due_ms = 0;
+			backend->pending_focus_warp = false;
+			return 0;
+		}
+		schedule_focus_retry(backend, 30);
+		return 0;
+	}
+
+	server->pending_focus_window = NULL;
+	backend->pending_focus_due_ms = 0;
+	if (backend->pending_focus_warp)
+		(void)inis_server_focus_window_with_warp(server, pending);
+	else
+		(void)inis_server_focus_window(server, pending);
+	backend->pending_focus_warp = false;
 	inis_server_flush_damage(server, "focus-retry");
 	return 0;
 }
@@ -453,6 +506,7 @@ swc_new_screen(struct swc_screen *screen)
 	struct inis_rect geometry;
 	struct inis_rect usable;
 	struct inis_server *server;
+	struct inis_monitor *monitor;
 
 	inis_info("swc screen: %dx%d at %d,%d usable %dx%d at %d,%d",
 	    (int)screen->geometry.width, (int)screen->geometry.height,
@@ -468,7 +522,78 @@ swc_new_screen(struct swc_screen *screen)
 	snprintf(name, sizeof(name), "swc-%zu", server->monitor_count);
 	geometry = rect_from_swc(&screen->geometry);
 	usable   = rect_from_swc(&screen->usable_geometry);
-	inis_server_add_monitor(server, name, &geometry, &usable, screen);
+	monitor = inis_server_add_monitor(server, name, &geometry, &usable, screen);
+	if (monitor != NULL)
+		swc_screen_set_handler(screen, &screen_handler, monitor);
+}
+
+/*
+ * Resolve the inis monitor that owns this screen.  The handler data pointer is
+ * the monitor itself, but it may have been invalidated; the screen pointer is
+ * the source of truth, so the geometry/usable callbacks re-read it directly.
+ */
+static void
+swc_screen_apply_geometry(struct inis_monitor *monitor)
+{
+	struct swc_screen *screen;
+	struct inis_rect geometry;
+	struct inis_rect usable;
+
+	if (monitor == NULL || active_backend == NULL ||
+	    active_backend->server == NULL)
+		return;
+	screen = monitor->swc;
+	if (screen == NULL)
+		return;
+
+	geometry = rect_from_swc(&screen->geometry);
+	usable = rect_from_swc(&screen->usable_geometry);
+
+	/*
+	 * swc emits usable_geometry_changed on every layer-surface relayout, so
+	 * an animated bar (e.g. a Quickshell panel like noctalia) can fire it
+	 * every frame.  React only when the geometry or backend usable area
+	 * actually changed: this avoids a per-frame arrange storm and, since the
+	 * new values are committed before scheduling, breaks any re-entrant loop
+	 * where arranging would itself nudge swc to recompute usable geometry.
+	 */
+	if (rect_equal(&geometry, &monitor->geometry) &&
+	    rect_equal(&usable, &monitor->backend_usable))
+		return;
+
+	monitor->geometry = geometry;
+	monitor->backend_usable = usable;
+	inis_server_monitor_layout_changed(active_backend->server, monitor);
+}
+
+static void
+swc_screen_destroy(void *data)
+{
+	struct inis_monitor *monitor = data;
+
+	if (monitor == NULL)
+		return;
+	inis_info("swc screen destroyed: %s", monitor->name);
+	monitor->swc = NULL;
+	monitor->enabled = false;
+	/*
+	 * Defer the re-arrange to the idle handler rather than running it inside
+	 * swc's destroy callback, where the screen is being torn down.
+	 */
+	if (active_backend != NULL && active_backend->server != NULL)
+		inis_backend_schedule_arrange(active_backend);
+}
+
+static void
+swc_screen_geometry_changed(void *data)
+{
+	swc_screen_apply_geometry(data);
+}
+
+static void
+swc_screen_usable_geometry_changed(void *data)
+{
+	swc_screen_apply_geometry(data);
 }
 
 static void
@@ -487,11 +612,8 @@ swc_new_window(struct swc_window *window)
 	}
 
 	/*
-	 * Set handler and tiled mode BEFORE add_window so that when arrange()
-	 * calls swc_window_set_geometry inside add_window, swc already knows
-	 * the window is tiled and applies the geometry immediately. Without
-	 * this ordering, the window appears at an undefined position and then
-	 * snaps — leaving a visible gap in the tiled layout.
+	 * Set handler and tiled mode BEFORE add_window so swc already knows the
+	 * window is tiled by the time the deferred arrange applies its geometry.
 	 */
 	swc_window_set_handler(window, &window_handler, data);
 	swc_window_set_tiled(window);
@@ -510,8 +632,25 @@ swc_new_window(struct swc_window *window)
 		return;
 	}
 	data->window = inis_window;
+	/* swc_window_set_tiled above already pushed TILED to swc. */
+	inis_window->swc_mode = INIS_SWC_MODE_TILED;
 
-	/* Show after geometry is applied — window appears at final position. */
+	/*
+	 * Send the window its real geometry NOW, in the same event-loop iteration
+	 * it was created in and before it is shown.  swc configures a tiled window
+	 * with no explicit geometry to the full output size, so without this the
+	 * client renders a full-screen first buffer and the window flashes before
+	 * the deferred arrange (one tick later) snaps it to its tile.  Pre-placing
+	 * here sends the correct configure up front — the equivalent of an X11 WM
+	 * resizing a window before mapping it — so it appears directly in place.
+	 *
+	 * Only the new window is configured; the other windows are still resized
+	 * by the deferred arrange, which avoids re-configuring them mid-configure
+	 * (that crashes swc).
+	 */
+	inis_server_preplace_window(active_backend->server, inis_window);
+
+	/* Now reveal it: geometry is already correct, so no full-screen flash. */
 	swc_window_show(window);
 	sync_transient_geometry(inis_window);
 
@@ -527,15 +666,15 @@ swc_new_window(struct swc_window *window)
 	 * arrange-idle callback checks whether the currently focused window's
 	 * internal swc state is safe to unfocus (using the same pointer chain),
 	 * and either applies focus immediately or starts a 200 ms retry timer.
+	 *
+	 * Warp the pointer to the new window: opening something new is one of the
+	 * two cases (the other being arrow-key movefocus) where focus is driven by
+	 * the keyboard rather than the cursor, so the cursor should follow.  This
+	 * keeps focus-follows-mouse consistent — without the warp the pointer would
+	 * stay over the old window and immediately steal focus back on the next
+	 * motion event.
 	 */
-	{
-		struct inis_server *s = active_backend->server;
-
-		if (s->focused_window == NULL ||
-		    s->focused_window->state != INIS_WINDOW_FULLSCREEN ||
-		    window_is_transient_child_of(inis_window, s->focused_window))
-			s->pending_focus_window = inis_window;
-	}
+	request_pending_focus(active_backend, inis_window, true);
 }
 
 static void
@@ -666,28 +805,7 @@ swc_window_entered(void *data)
 	    window_data->window != server->focused_window)
 		return;
 
-	if (window_data->window != server->focused_window &&
-	    !swc_window_focus_safe(server)) {
-		server->pending_focus_window = window_data->window;
-		schedule_focus_retry(active_backend, 200);
-		return;
-	}
-
-	inis_server_focus_window(server, window_data->window);
-}
-
-static void
-swc_window_fullscreen_requested(void *data, struct swc_screen *screen,
-    bool fullscreen)
-{
-	struct swc_window_data *window_data = data;
-
-	if (window_data == NULL || window_data->window == NULL ||
-	    active_backend == NULL || active_backend->server == NULL)
-		return;
-
-	(void)inis_server_request_fullscreen(active_backend->server,
-	    window_data->window, screen, fullscreen);
+	(void)inis_server_focus_window(server, window_data->window);
 }
 
 static void
@@ -748,17 +866,24 @@ swc_ipc(int fd, uint32_t mask, void *data)
 	return 0;
 }
 
-static void
+static int
 arrange_idle_cb(void *data)
 {
 	struct inis_backend *backend = data;
 	struct inis_server *server;
 	size_t i;
 
-	backend->arrange_idle = NULL;
+	/*
+	 * Keep the timer source alive for reuse; only clear the scheduled flag.
+	 * Nulling the pointer without wl_event_source_remove leaked one event
+	 * source per arrange — with a layer-shell bar (Quickshell) triggering
+	 * frequent relayouts, thousands of dead sources accumulated in the event
+	 * loop and degraded it over time.
+	 */
+	backend->arrange_scheduled = false;
 	server = backend->server;
 	if (server == NULL)
-		return;
+		return 0;
 
 	/*
 	 * Re-focus after window removal.  All destroy callbacks in the batch
@@ -778,7 +903,8 @@ arrange_idle_cb(void *data)
 
 			if (!candidate->mapped || candidate->swc == NULL)
 				continue;
-			if (inis_server_focus_window(server, candidate) == 0)
+			request_pending_focus(backend, candidate, false);
+			if (server->pending_focus_window == candidate)
 				break;
 		}
 	}
@@ -787,13 +913,28 @@ arrange_idle_cb(void *data)
 	inis_server_flush_damage(server, "deferred-arrange");
 
 	/*
-	 * Apply focus to newly opened window.  swc_window_focus_safe() checks
-	 * whether the currently focused window's internal swc state is ready
-	 * to be unfocused.  If not, apply_pending_focus starts a 200 ms retry
-	 * timer so the focus is applied as soon as the first render commit
-	 * arrives.
+	 * Re-assert keyboard focus on the window inis believes is focused.  A
+	 * layer-shell surface with keyboard interactivity (e.g. a Quickshell
+	 * launcher) that dies drops swc's keyboard focus to NULL without
+	 * telling the WM, leaving the keyboard dead until a manual refocus.
+	 * Only when swc's focus is actually empty: re-asserting while a
+	 * keyboard-interactive layer surface legitimately holds focus (open
+	 * launcher) would steal its input mid-typing.
+	 */
+	if (server->focused_window != NULL &&
+	    server->pending_focus_window == NULL &&
+	    server->focused_window->mapped &&
+	    server->focused_window->swc != NULL &&
+	    !swc_keyboard_has_focus())
+		inis_backend_focus_window(backend, server->focused_window);
+
+	/*
+	 * Apply pending focus after the deferred arrange.  The retry logic is
+	 * time-based rather than peeking into swc internals, which keeps the
+	 * compositor out of fragile pointer-chasing during window teardown.
 	 */
 	apply_pending_focus(backend);
+	return 0;
 }
 
 static void
@@ -972,10 +1113,6 @@ inis_backend_swc_finish(struct inis_backend *backend)
 		wl_event_source_remove(backend->focus_retry_timer);
 		backend->focus_retry_timer = NULL;
 	}
-	if (backend->arrange_retry_timer != NULL) {
-		wl_event_source_remove(backend->arrange_retry_timer);
-		backend->arrange_retry_timer = NULL;
-	}
 	if (backend->grab_timer != NULL) {
 		wl_event_source_remove(backend->grab_timer);
 		backend->grab_timer = NULL;
@@ -1062,6 +1199,13 @@ inis_backend_swc_focus_window(struct inis_backend *backend,
 }
 
 void
+inis_backend_swc_warp_pointer(struct inis_backend *backend, int x, int y)
+{
+	(void)backend;
+	(void)swc_cursor_warp(x * 256, y * 256);
+}
+
+void
 inis_backend_swc_update_window_style(struct inis_backend *backend,
     struct inis_window *window)
 {
@@ -1087,33 +1231,44 @@ inis_backend_swc_apply_window(struct inis_backend *backend,
 	if (window->swc == NULL)
 		return;
 
-	if (!window_ready_for_managed_configure(window)) {
-		schedule_arrange_retry(backend, 200);
-		return;
-	}
-
 	inis_backend_swc_update_window_style(backend, window);
 
+	/*
+	 * Only push a mode change to swc when it actually changed.  swc's mode
+	 * setters send an xdg configure unconditionally, so re-asserting the
+	 * mode for every window on every arrange (frequent with an animating
+	 * layer-shell bar) floods clients with configure events.
+	 */
 	if (window->state == INIS_WINDOW_FULLSCREEN) {
 		if (backend->server != NULL &&
-		    window->monitor_index < backend->server->monitor_count)
+		    window->monitor_index < backend->server->monitor_count &&
+		    (window->swc_mode != INIS_SWC_MODE_FULLSCREEN ||
+		     window->swc_fullscreen_monitor != window->monitor_index)) {
 			swc_window_set_fullscreen(window->swc,
 			    backend->server->monitors[
 			        window->monitor_index].swc);
+			window->swc_mode = INIS_SWC_MODE_FULLSCREEN;
+			window->swc_fullscreen_monitor = window->monitor_index;
+		}
 		return;
 	}
 
 	if (window->state == INIS_WINDOW_FLOATING) {
 		rect = &window->floating;
 		if (window->transient) {
-			swc_window_set_stacked(window->swc);
+			if (window->swc_mode != INIS_SWC_MODE_STACKED) {
+				swc_window_set_stacked(window->swc);
+				window->swc_mode = INIS_SWC_MODE_STACKED;
+			}
 			swc_window_set_position(window->swc, rect->x, rect->y);
 			return;
 		}
-		swc_window_set_tiled(window->swc);
 	} else {
 		rect = &window->tiled;
+	}
+	if (window->swc_mode != INIS_SWC_MODE_TILED) {
 		swc_window_set_tiled(window->swc);
+		window->swc_mode = INIS_SWC_MODE_TILED;
 	}
 
 	swc_window_set_geometry(window->swc,
@@ -1159,13 +1314,25 @@ inis_backend_swc_schedule_arrange(struct inis_backend *backend)
 {
 	struct wl_event_loop *loop;
 
-	if (backend->arrange_idle != NULL)
+	if (backend->arrange_scheduled)
 		return;
 	if (backend->display == NULL)
 		return;
-	loop = wl_display_get_event_loop(backend->display);
-	backend->arrange_idle = wl_event_loop_add_idle(loop, arrange_idle_cb,
-	    backend);
+	/*
+	 * Use a short timer instead of an idle callback.  Closing heavy clients
+	 * can keep the Wayland loop busy enough that idle arrange is delayed,
+	 * leaving stale layout gaps until another event happens.  The timer
+	 * source is created once and re-armed thereafter.
+	 */
+	if (backend->arrange_idle == NULL) {
+		loop = wl_display_get_event_loop(backend->display);
+		backend->arrange_idle = wl_event_loop_add_timer(loop,
+		    arrange_idle_cb, backend);
+	}
+	if (backend->arrange_idle != NULL) {
+		wl_event_source_timer_update(backend->arrange_idle, 1);
+		backend->arrange_scheduled = true;
+	}
 }
 
 

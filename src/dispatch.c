@@ -35,6 +35,7 @@ static void dispatch_cycleprev(struct inis_server *server, const char *args);
 static void dispatch_togglespecialworkspace(struct inis_server *server, const char *args);
 static void dispatch_movewindow(struct inis_server *server, const char *args);
 static void dispatch_resizewindow(struct inis_server *server, const char *args);
+static void dispatch_reserved(struct inis_server *server, const char *args);
 static void dispatch_reload(struct inis_server *server, const char *args);
 
 static const struct inis_dispatcher dispatchers[] = {
@@ -61,6 +62,7 @@ static const struct inis_dispatcher dispatchers[] = {
 	{ "togglespecialworkspace", dispatch_togglespecialworkspace },
 	{ "movewindow", dispatch_movewindow },
 	{ "resizewindow", dispatch_resizewindow },
+	{ "reserved", dispatch_reserved },
 	{ "reload", dispatch_reload },
 };
 
@@ -403,6 +405,40 @@ dispatch_resizewindow(struct inis_server *server, const char *args)
 	(void)args;
 	if (inis_server_begin_mouse_resize(server, INIS_WINDOW_EDGE_AUTO) != 0)
 		inis_debug("resizewindow ignored: no focused window");
+}
+
+static void
+dispatch_reserved(struct inis_server *server, const char *args)
+{
+	char name[INIS_MAX_NAME];
+	int top, bottom, left, right;
+	int matched;
+
+	if (args == NULL || args[0] == '\0') {
+		inis_warn("reserved requires: [MONITOR] TOP BOTTOM LEFT RIGHT");
+		return;
+	}
+
+	/* Named-monitor form: MONITOR TOP BOTTOM LEFT RIGHT. */
+	if (sscanf(args, "%63s %d %d %d %d", name, &top, &bottom, &left,
+	    &right) == 5) {
+		matched = inis_server_set_monitor_reserved(server, name, top,
+		    bottom, left, right);
+		if (matched == 0)
+			inis_warn("reserved: no monitor named %s", name);
+		return;
+	}
+
+	/* Global form: TOP BOTTOM LEFT RIGHT (all monitors). */
+	if (sscanf(args, "%d %d %d %d", &top, &bottom, &left, &right) == 4) {
+		matched = inis_server_set_monitor_reserved(server, NULL, top,
+		    bottom, left, right);
+		if (matched == 0)
+			inis_warn("reserved: no monitors connected");
+		return;
+	}
+
+	inis_warn("reserved requires: [MONITOR] TOP BOTTOM LEFT RIGHT");
 }
 
 static void

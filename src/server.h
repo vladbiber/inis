@@ -54,6 +54,8 @@ void inis_server_mark_damage(struct inis_server *server,
 void inis_server_flush_damage(struct inis_server *server, const char *why);
 int inis_server_focus_window(struct inis_server *server,
     struct inis_window *window);
+int inis_server_focus_window_with_warp(struct inis_server *server,
+    struct inis_window *window);
 int inis_server_focus_next(struct inis_server *server, int direction);
 int inis_server_focus_direction(struct inis_server *server,
     enum wc_direction direction);
@@ -78,8 +80,14 @@ struct inis_monitor *inis_server_add_monitor(struct inis_server *server,
     const struct inis_rect *usable, void *backend_monitor);
 struct inis_window *inis_server_add_window(struct inis_server *server,
     const char *app_id, const char *title, void *backend_window);
+void inis_server_preplace_window(struct inis_server *server,
+    struct inis_window *window);
 void inis_server_remove_window(struct inis_server *server,
     struct inis_window *window);
 void inis_server_reload_config(struct inis_server *server);
+void inis_server_monitor_layout_changed(struct inis_server *server,
+    struct inis_monitor *monitor);
+int inis_server_set_monitor_reserved(struct inis_server *server,
+    const char *name, int top, int bottom, int left, int right);
 
 #endif
