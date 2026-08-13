@@ -303,6 +303,24 @@ index caa34fc..af9b1f2 100644
  	layer_surface->view_handler.impl = &view_handler_impl;
  	layer_surface->modifier.modify = modify;
  	wl_list_init(&layer_surface->modifier.link);
+diff --git a/libswc/output.c b/libswc/output.c
+index 8b26ae4..608ca2e 100644
+--- a/libswc/output.c
++++ b/libswc/output.c
+@@ -55,6 +55,13 @@ bind_output(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+ 		                    mode->refresh);
+ 	}
+ 
++	/* Without an explicit scale event some clients keep their zero-
++	 * initialized default: wbg then allocates a 1920*0 x 1080*0 shm buffer
++	 * and dies on mmap, showing no wallpaper. */
++	if (version >= 2) {
++		wl_output_send_scale(resource, 1);
++	}
++
+ 	if (version >= 4) {
+ 		wl_output_send_name(resource, output->name);
+ 	}
 diff --git a/libswc/panel.c b/libswc/panel.c
 index 5434d38..ae0d964 100644
 --- a/libswc/panel.c
