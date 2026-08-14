@@ -115,10 +115,10 @@ index ed7788f..f45b9d7 100644
  	                         region->extents.x1 + dst_x,
  	                         region->extents.y1 + dst_y,
 diff --git a/renderer.c b/renderer.c
-index 2f49bc8..bf3dbb5 100644
+index bec0456..a8a2cac 100644
 --- a/renderer.c
 +++ b/renderer.c
-@@ -143,6 +143,25 @@ wld_copy_region(struct wld_renderer *renderer,
+@@ -139,6 +139,25 @@ wld_copy_region(struct wld_renderer *renderer,
  	                            dst_x, dst_y, region);
  }
  
@@ -141,11 +141,11 @@ index 2f49bc8..bf3dbb5 100644
 +	return true;
 +}
 +
- EXPORT
- void
- wld_blend_region(struct wld_renderer *renderer, struct wld_buffer *buffer,
+ 
+ /* https://en.wikipedia.org/wiki/Midpoint_circle_algorithm */
+ static void
 diff --git a/wld-private.h b/wld-private.h
-index 5a02630..bc470f9 100644
+index 4f65f73..d4a30a0 100644
 --- a/wld-private.h
 +++ b/wld-private.h
 @@ -108,6 +108,15 @@ struct wld_renderer_impl {
@@ -165,7 +165,7 @@ index 5a02630..bc470f9 100644
  				int32_t x, int32_t y, uint32_t r, bool fill);
  	void (*draw_line)(struct wld_renderer *renderer, uint32_t color,
 diff --git a/wld.h b/wld.h
-index 8191ae3..02cbf2d 100644
+index 9885882..1132a8d 100644
 --- a/wld.h
 +++ b/wld.h
 @@ -253,6 +253,22 @@ void wld_copy_region(struct wld_renderer *renderer,
@@ -188,6 +188,6 @@ index 8191ae3..02cbf2d 100644
 +                     uint32_t dst_width, uint32_t dst_height,
 +                     pixman_region32_t *clip);
 +
- void wld_blend_region(struct wld_renderer *renderer,
-                       struct wld_buffer *buffer,
-                       int32_t dst_x, int32_t dst_y,
+ void wld_draw_circle(struct wld_renderer *renderer, uint32_t color,
+ 				int32_t x, int32_t y, uint32_t r, bool fill);
+ 

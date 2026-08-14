@@ -47,7 +47,8 @@ clone_or_update() {
 		if [ "${NO_UPDATE:-0}" = "1" ]; then
 			echo "using existing source: $dir"
 		else
-			git -C "$dir" pull --ff-only
+			# fetch, not pull: the checkout is pinned to a commit below.
+			git -C "$dir" fetch --quiet
 		fi
 	else
 		if [ "${NO_UPDATE:-0}" = "1" ]; then
@@ -60,6 +61,15 @@ clone_or_update() {
 
 clone_or_update "https://git.sr.ht/~shrub900/neuwld" "$neuwld_dir"
 clone_or_update "https://git.sr.ht/~shrub900/neuswc" "$neuswc_dir"
+
+# PINNED upstream commits — the patches are generated against exactly these.
+# Building upstream HEAD once regressed rendering (neuwld driver-selection
+# changes switched the renderer on real hardware: ghost trails + black
+# layer surfaces).  Bump deliberately, regenerating both patches.
+neuwld_commit="bb5d247e7b3d0f68dda3990f9b2100aaaec85d28"
+neuswc_commit="975ad56221d4545bdd44d14fdd4cac796de207d9"
+git -C "$neuwld_dir" checkout --quiet "$neuwld_commit"
+git -C "$neuswc_dir" checkout --quiet "$neuswc_commit"
 
 # Apply the combined integration patch idempotently: `--reverse --check`
 # succeeds only when it is already applied, in which case we skip.

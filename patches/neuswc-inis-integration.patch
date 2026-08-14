@@ -1,5 +1,5 @@
 diff --git a/libswc/compositor.c b/libswc/compositor.c
-index cb8ce7f..c68a23b 100644
+index cb8ce7f..354a8e2 100644
 --- a/libswc/compositor.c
 +++ b/libswc/compositor.c
 @@ -43,6 +43,7 @@
@@ -33,7 +33,7 @@ index cb8ce7f..c68a23b 100644
  		pixman_region32_init_rect(&buffer_region, geom->x, geom->y, geom->width,
  		                          geom->height);
  	} else {
-@@ -287,11 +293,41 @@ repaint_view(struct target *target, struct compositor_view *view,
+@@ -287,11 +293,61 @@ repaint_view(struct target *target, struct compositor_view *view,
  	pixman_region32_intersect(&buffer_damage, &view_damage, &buffer_region);
  
  	if (pixman_region32_not_empty(&buffer_damage)) {
@@ -49,7 +49,27 @@ index cb8ce7f..c68a23b 100644
 +		                         &src_x, &src_y, &src_width, &src_height)) {
 +			/* Viewport: composite the source rectangle scaled onto the
 +			 * view geometry, clipped to the damaged area.  The clip is in
-+			 * target coordinates: global minus the target origin. */
++			 * target coordinates: global minus the target origin.
++			 *
++			 * The view may additionally be cropped inside the surface by
++			 * xdg window geometry (buffer_offset, geom size) — e.g. Qt
++			 * cutting off its client-side shadows.  That crop lives in
++			 * SURFACE coordinates; map it back into the viewport source
++			 * rectangle with the surface->source scale factors. */
++			{
++				uint32_t surf_w, surf_h;
++
++				if (surface_viewport_size(view->surface, &surf_w, &surf_h) &&
++				    surf_w > 0 && surf_h > 0) {
++					double fx = src_width / surf_w;
++					double fy = src_height / surf_h;
++
++					src_x += view->buffer_offset_x * fx;
++					src_y += view->buffer_offset_y * fy;
++					src_width = geom->width * fx;
++					src_height = geom->height * fy;
++				}
++			}
 +			pixman_region32_translate(&buffer_damage,
 +			                          -target_geom->x, -target_geom->y);
 +			if (!wld_copy_scaled(swc.drm->renderer, view->buffer,
@@ -80,7 +100,7 @@ index cb8ce7f..c68a23b 100644
  	}
  
  	pixman_region32_fini(&view_damage);
-@@ -400,7 +436,11 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
+@@ -400,7 +456,11 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
  	      target->view->geometry.x, target->view->geometry.y,
  	      target->view->geometry.width, target->view->geometry.height);
  
@@ -93,12 +113,16 @@ index cb8ce7f..c68a23b 100644
  
  	if (pixman_region32_not_empty(base_damage)) {
  		pixman_region32_translate(base_damage, -target->view->geometry.x,
-@@ -954,6 +994,16 @@ attach(struct view *base, struct wld_buffer *buffer)
- 			view->buffer_offset_y = surface->window_y;
- 		}
- 	}
-+	/* wp_viewporter: the surface size is the viewport destination (or the
-+	 * source size), independent of the buffer dimensions. */
+@@ -946,6 +1006,20 @@ attach(struct view *base, struct wld_buffer *buffer)
+ 
+ 	view->buffer_offset_x = 0;
+ 	view->buffer_offset_y = 0;
++	/* wp_viewporter first: it defines the surface size in surface
++	 * coordinates (destination or source size), independent of the buffer
++	 * dimensions.  xdg window geometry below then crops WITHIN that
++	 * surface, so it must win for the final view size/offset — Qt sets
++	 * both (viewport for scaling, window geometry to cut off client-side
++	 * shadows). */
 +	if (surface && buffer) {
 +		uint32_t vp_width, vp_height;
 +
@@ -107,10 +131,10 @@ index cb8ce7f..c68a23b 100644
 +			new_height = vp_height;
 +		}
 +	}
- 
- 	if (view_set_size(&view->base, new_width, new_height)) {
- 		/* The view was resized. */
-@@ -996,8 +1046,9 @@ move(struct view *base, int32_t x, int32_t y)
+ 	if (surface && surface->has_window_geometry && buffer) {
+ 		if (surface->window_width > 0 && surface->window_height > 0) {
+ 			new_width = (uint32_t)surface->window_width;
+@@ -996,8 +1070,9 @@ move(struct view *base, int32_t x, int32_t y)
  
  		if (view->visible) {
  			/* Assume worst-case no clipping until we draw the next frame (in
@@ -122,7 +146,7 @@ index cb8ce7f..c68a23b 100644
  
  			view_update_screens(&view->base);
  			damage_below_view(view);
-@@ -1355,9 +1406,31 @@ compositor_create_view(struct surface *surface)
+@@ -1355,9 +1430,31 @@ compositor_create_view(struct surface *surface)
  void
  compositor_view_destroy(struct compositor_view *view)
  {
@@ -154,7 +178,7 @@ index cb8ce7f..c68a23b 100644
  	view_finalize(&view->base);
  	decor_view_finalize(view);
  	pixman_region32_fini(&view->clip);
-@@ -1377,6 +1450,11 @@ compositor_view_set_parent(struct compositor_view *view,
+@@ -1377,6 +1474,11 @@ compositor_view_set_parent(struct compositor_view *view,
  {
  	view->parent = parent;
  
@@ -166,7 +190,7 @@ index cb8ce7f..c68a23b 100644
  	if (parent->visible) {
  		compositor_view_show(view);
  	} else {
-@@ -1412,7 +1490,7 @@ compositor_view_restack(struct compositor_view *view,
+@@ -1412,7 +1514,7 @@ compositor_view_restack(struct compositor_view *view,
  void
  compositor_view_show(struct compositor_view *view)
  {
@@ -175,7 +199,7 @@ index cb8ce7f..c68a23b 100644
  	struct subsurface *subsurface;
  
  	if (view->visible) {
-@@ -1439,7 +1517,9 @@ compositor_view_show(struct compositor_view *view)
+@@ -1439,7 +1541,9 @@ compositor_view_show(struct compositor_view *view)
  	damage_view(view);
  	update(&view->base);
  
@@ -186,7 +210,7 @@ index cb8ce7f..c68a23b 100644
  	{
  		if (other->parent == view) {
  			compositor_view_show(other);
-@@ -1450,7 +1530,7 @@ compositor_view_show(struct compositor_view *view)
+@@ -1450,7 +1554,7 @@ compositor_view_show(struct compositor_view *view)
  void
  compositor_view_hide(struct compositor_view *view)
  {
@@ -195,7 +219,7 @@ index cb8ce7f..c68a23b 100644
  
  	if (!view->visible) {
  		return;
-@@ -1463,7 +1543,7 @@ compositor_view_hide(struct compositor_view *view)
+@@ -1463,7 +1567,7 @@ compositor_view_hide(struct compositor_view *view)
  	view_set_screens(&view->base, 0);
  	view->visible = false;
  
